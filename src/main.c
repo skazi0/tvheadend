@@ -60,6 +60,10 @@
 #include "ffdecsa/FFdecsa.h"
 #include "muxes.h"
 #include "config2.h"
+#include "imagecache.h"
+#if ENABLE_LIBAV
+#include "libav.h"
+#endif
 
 int running;
 time_t dispatch_clock;
@@ -76,20 +80,22 @@ int log_debug_to_console;
 int webui_port;
 int htsp_port;
 int htsp_port_extra;
-char *tvheadend_cwd;
+const char *tvheadend_cwd;
 const char *tvheadend_webroot;
-
-const char *tvheadend_capabilities[] = {
+const tvh_caps_t tvheadend_capabilities[] = {
 #if ENABLE_CWC
-  "cwc",
+  { "cwc", NULL },
 #endif
 #if ENABLE_V4L
-  "v4l",
+  { "v4l", NULL },
 #endif
 #if ENABLE_LINUXDVB
-  "linuxdvb",
+  { "linuxdvb", NULL },
 #endif
-  NULL
+#if ENABLE_IMAGECACHE
+  { "imagecache", &imagecache_enabled },
+#endif
+  { NULL, NULL }
 };
 
 static void
@@ -270,6 +276,7 @@ main(int argc, char **argv)
   const char *pidpath = "/var/run/tvheadend.pid";
   struct group *grp;
   struct passwd *pw;
+  char *webroot;
   const char *usernam = NULL;
   const char *groupnam = NULL;
   int logfacility = LOG_DAEMON;
@@ -369,7 +376,16 @@ main(int argc, char **argv)
       join_transport = optarg;
       break;
     case 'W':
-      tvheadend_webroot = optarg;
+      webroot = malloc(strlen(optarg) + (*optarg == '/' ? 0 : 1));
+      if (*optarg != '/') {
+        *webroot = '/';
+        strcpy(webroot+1, optarg);
+      } else {
+        strcpy(webroot, optarg);
+      }
+      if (webroot[strlen(webroot)-1] == '/')
+        webroot[strlen(webroot)-1] = '\0';
+      tvheadend_webroot = webroot;
       break;
     default:
       usage(argv[0]);
@@ -453,7 +469,13 @@ main(int argc, char **argv)
    * Initialize subsystems
    */
 
+#if ENABLE_LIBAV
+  libav_init();
+#endif
+
   config_init();
+
+  imagecache_init();
 
   service_init();
 

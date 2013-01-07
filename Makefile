@@ -109,6 +109,7 @@ SRCS =  src/main.c \
   src/config2.c \
   src/lang_codes.c \
   src/lang_str.c \
+  src/imagecache.c
 
 SRCS += src/epggrab/module.c\
   src/epggrab/channel.c\
@@ -126,8 +127,6 @@ SRCS += src/plumbing/tsfix.c \
 SRCS += src/dvr/dvr_db.c \
 	src/dvr/dvr_rec.c \
 	src/dvr/dvr_autorec.c \
-	src/dvr/ebml.c \
-	src/dvr/mkmux.c \
 
 SRCS += src/webui/webui.c \
 	src/webui/comet.c \
@@ -137,8 +136,10 @@ SRCS += src/webui/webui.c \
 	src/webui/html.c\
 
 SRCS += src/muxer.c \
-	src/muxer_pass.c \
-	src/muxer_tvh.c \
+	src/muxer/muxer_pass.c \
+	src/muxer/muxer_tvh.c \
+	src/muxer/tvh/ebml.c \
+	src/muxer/tvh/mkmux.c \
 
 #
 # Optional code
@@ -169,6 +170,10 @@ SRCS-${CONFIG_V4L} += \
 
 # Avahi
 SRCS-$(CONFIG_AVAHI) += src/avahi.c
+
+# libav
+SRCS-$(CONFIG_LIBAV) += src/libav.c \
+	src/muxer/muxer_libav.c
 
 # CWC
 SRCS-${CONFIG_CWC} += src/cwc.c \

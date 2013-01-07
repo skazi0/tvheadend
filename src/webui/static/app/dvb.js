@@ -507,6 +507,10 @@ tvheadend.dvb_services = function(adapterId) {
 			dataIndex : 'network',
 			width : 100
 		}, {
+			header : "Encryption",
+			dataIndex : 'encryption',
+			width : 100
+		}, {
 			header : "Multiplex",
 			dataIndex : 'mux',
 			width : 100
@@ -535,8 +539,8 @@ tvheadend.dvb_services = function(adapterId) {
 	var store = new Ext.data.JsonStore({
 		root : 'entries',
 		fields : Ext.data.Record.create([ 'id', 'enabled', 'type', 'sid', 'pmt',
-			'pcr', 'svcname', 'network', 'provider', 'mux', 'channelname', 'prefcapid',
-			'dvb_charset', 'dvb_eit_enable', 'dvb_eit_keyword' ]),
+			'pcr', 'svcname', 'network', 'provider', 'encryption', 'mux', 'channelname',
+			'prefcapid', 'dvb_charset', 'dvb_eit_enable', 'dvb_eit_keyword' ]),
 		url : "dvb/services/" + adapterId,
 		autoLoad : true,
 		id : 'id',

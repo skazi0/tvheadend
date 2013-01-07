@@ -79,9 +79,9 @@ dvr_rec_subscribe(dvr_entry_t *de)
     flags = SUBSCRIPTION_RAW_MPEGTS;
   } else {
     streaming_queue_init(&de->de_sq, 0);
-    de->de_gh = globalheaders_create(&de->de_sq.sq_st);
-    de->de_tsfix = tsfix_create(de->de_gh);
-    st = de->de_tsfix;
+    de->de_tsfix = tsfix_create(&de->de_sq.sq_st);
+    tsfix_set_start_time(de->de_tsfix, de->de_start - (60 * de->de_start_extra));
+    st = de->de_gh = globalheaders_create(de->de_tsfix);
     flags = 0;
   }
 
@@ -398,10 +398,13 @@ static void *
 dvr_thread(void *aux)
 {
   dvr_entry_t *de = aux;
+  dvr_config_t *cfg = dvr_config_find_by_name_default(de->de_config_name);
   streaming_queue_t *sq = &de->de_sq;
   streaming_message_t *sm;
+  th_pkt_t *pkt;
   int run = 1;
   int started = 0;
+  int comm_skip = (cfg->dvr_flags & DVR_SKIP_COMMERCIALS);
 
   pthread_mutex_lock(&sq->sq_mutex);
 
@@ -417,12 +420,26 @@ dvr_thread(void *aux)
     pthread_mutex_unlock(&sq->sq_mutex);
 
     switch(sm->sm_type) {
-    case SMT_MPEGTS:
-    case SMT_PACKET:
-      if(started &&
-	 dispatch_clock > de->de_start - (60 * de->de_start_extra)) {
-	dvr_rec_set_state(de, DVR_RS_RUNNING, 0);
 
+    case SMT_PACKET:
+      pkt = sm->sm_data;
+      if(pkt->pkt_commercial == COMMERCIAL_YES) {
+	dvr_rec_set_state(de, DVR_RS_COMMERCIAL, 0);
+	tsfix_set_comm_skip(de->de_tsfix, comm_skip);
+      } else {
+	dvr_rec_set_state(de, DVR_RS_RUNNING, 0);
+	tsfix_set_comm_skip(de->de_tsfix, 0);
+      }
+
+      if(started) {
+	muxer_write_pkt(de->de_mux, sm->sm_type, sm->sm_data);
+	sm->sm_data = NULL;
+      }
+      break;
+
+    case SMT_MPEGTS:
+      if(started) {
+	dvr_rec_set_state(de, DVR_RS_RUNNING, 0);
 	muxer_write_pkt(de->de_mux, sm->sm_type, sm->sm_data);
 	sm->sm_data = NULL;
       }

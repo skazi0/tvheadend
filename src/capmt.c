@@ -227,7 +227,7 @@ static int
 capmt_send_msg(capmt_t *capmt, int sid, const uint8_t *buf, size_t len)
 {
   if (capmt->capmt_oscam) {
-    int i, sent = 0;
+    int i;
 
     // dumping current SID table
     for (i = 0; i < MAX_SOCKETS; i++)
@@ -280,18 +280,17 @@ capmt_send_msg(capmt_t *capmt, int sid, const uint8_t *buf, size_t len)
         tvhlog(LOG_DEBUG, "capmt", "created socket with socket_fd=%d", capmt->capmt_sock[i]);
     }
     if (capmt->capmt_sock[i] > 0) {
-      sent = write(capmt->capmt_sock[i], buf, len);
-      tvhlog(LOG_DEBUG, "capmt", "socket_fd=%d len=%d sent=%d", capmt->capmt_sock[i], (int)len, sent);
-      if (sent != len) {
-        tvhlog(LOG_ERR, "capmt", "%s: len != sent", __FUNCTION__);
+      if (tvh_write(capmt->capmt_sock[i], buf, len)) {
+        tvhlog(LOG_DEBUG, "capmt", "socket_fd=%d send failed", capmt->capmt_sock[i]);
         close(capmt->capmt_sock[i]);
         capmt->capmt_sock[i] = 0;
+        return -1;
       }
     }
-    return sent;
   }
   else  // standard old capmt mode
-    return write(capmt->capmt_sock[0], buf, len);
+    tvh_write(capmt->capmt_sock[0], buf, len);
+  return 0;
 }
 
 static void 
@@ -1010,6 +1009,10 @@ capmt_service_start(service_t *t)
   lock_assert(&global_lock);
 
   TAILQ_FOREACH(capmt, &capmts, capmt_link) {
+    /* skip, if we're not active */
+    if (!capmt->capmt_enabled)
+      continue;
+
     tvhlog(LOG_INFO, "capmt",
       "Starting capmt server for service \"%s\" on tuner %d", 
       t->s_svcname,

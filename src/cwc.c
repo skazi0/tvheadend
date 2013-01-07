@@ -477,7 +477,7 @@ cwc_send_msg(cwc_t *cwc, const uint8_t *msg, size_t len, int sid, int enq)
 {
   cwc_message_t *cm = malloc(sizeof(cwc_message_t));
   uint8_t *buf = cm->cm_data;
-  int seq, n;
+  int seq;
 
   if(len + 12 > CWS_NETMSGSIZE) {
     free(cm);
@@ -513,8 +513,7 @@ cwc_send_msg(cwc_t *cwc, const uint8_t *msg, size_t len, int sid, int enq)
     pthread_cond_signal(&cwc->cwc_writer_cond);
     pthread_mutex_unlock(&cwc->cwc_writer_mutex);
   } else {
-    n = write(cwc->cwc_fd, buf, len);
-    if(n != len)
+    if (tvh_write(cwc->cwc_fd, buf, len))
       tvhlog(LOG_INFO, "cwc", "write error %s", strerror(errno));
 
     free(cm);
@@ -1032,7 +1031,8 @@ cwc_writer_thread(void *aux)
       TAILQ_REMOVE(&cwc->cwc_writeq, cm, cm_link);
       pthread_mutex_unlock(&cwc->cwc_writer_mutex);
       //      int64_t ts = getmonoclock();
-      r = write(cwc->cwc_fd, cm->cm_data, cm->cm_len);
+      if (tvh_write(cwc->cwc_fd, cm->cm_data, cm->cm_len))
+        tvhlog(LOG_INFO, "cwc", "write error %s", strerror(errno));
       //      printf("Write took %lld usec\n", getmonoclock() - ts);
       free(cm);
       pthread_mutex_lock(&cwc->cwc_writer_mutex);
@@ -1635,11 +1635,20 @@ cwc_table_input(struct th_descrambler *td, struct service *t,
       tvhlog(LOG_DEBUG, "cwc", "Insert after unexpected reply");
     }
 
-    if (ct->cs_okchannel == -3 && t->s_prefcapid == st->es_pid) {
-      ep = calloc(1, sizeof(ecm_pid_t));
-      ep->ep_pid = t->s_prefcapid;
-      LIST_INSERT_HEAD(&ct->cs_pids, ep, ep_link);
-      tvhlog(LOG_DEBUG, "cwc", "Insert only one new ECM channel %d for service id %d", t->s_prefcapid, sid);
+    if (ct->cs_okchannel == -3 && t->s_prefcapid != 0) {
+      if (t->s_prefcapid == st->es_pid) {
+        ep = calloc(1, sizeof(ecm_pid_t));
+        ep->ep_pid = t->s_prefcapid;
+        LIST_INSERT_HEAD(&ct->cs_pids, ep, ep_link);
+        tvhlog(LOG_DEBUG, "cwc", "Insert only one new ECM channel %d for service id %d", t->s_prefcapid, sid);
+      } else {
+        // check if prefcapid wrong
+        struct elementary_stream *prefca = service_stream_find(t, t->s_prefcapid);
+
+        if (!prefca || prefca->es_type != SCT_CA) {
+          t->s_prefcapid = 0;
+        }
+      }
     }
 
     if (ct->cs_okchannel == -1 || (ct->cs_okchannel == -3 && t->s_prefcapid == 0)) {

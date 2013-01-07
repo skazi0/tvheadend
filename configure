@@ -20,8 +20,10 @@ OPTIONS=(
   "v4l:yes"
   "linuxdvb:yes"
   "dvbscan:yes"
+  "imagecache:auto"
   "avahi:auto"
   "zlib:auto"
+  "libav:auto"
   "bundle:no"
   "dvbcsa:no"
 )
@@ -100,6 +102,32 @@ if enabled_or_auto avahi; then
 fi
 
 #
+# libav
+#
+if enabled_or_auto libav; then
+  has_libav=true
+
+  if $has_libav && ! check_pkg libavutil ">=50.43.0"; then
+    has_libav=false
+  fi
+
+  if $has_libav && ! check_pkg libavformat "<=55.0.0"; then
+    has_libav=false
+  fi
+
+  if $has_libav && ! check_pkg libavformat ">=50.43.0"; then
+    has_libav=false
+  fi
+
+  if $has_libav; then
+    enable libav
+  elif enabled libav; then
+    die "libav development support not found (use --disable-libav)"
+  fi
+fi
+
+
+#
 # DVB scan
 #
 if enabled linuxdvb && enabled dvbscan; then
@@ -126,7 +154,17 @@ if enabled cwc && enabled dvbcsa; then
   die "Failed to find dvbcsa support (use --disable-dvbcsa)"
   LDFLAGS="$LDFLAGS -ldvbcsa"
 fi
-  
+
+#
+# Icon caching
+#
+if enabled_or_auto imagecache; then
+  if check_pkg libcurl; then
+    enable imagecache
+  elif enabled imagecache; then
+    die "Libcurl support not found (use --disable-imagecache)"
+  fi  
+fi
 
 # ###########################################################################
 # Write config

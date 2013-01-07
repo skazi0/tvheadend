@@ -42,6 +42,7 @@
 #include "htsmsg_binary.h"
 #include "epg.h"
 #include "plumbing/tsfix.h"
+#include "imagecache.h"
 
 #include <sys/statvfs.h>
 #include "settings.h"
@@ -53,7 +54,7 @@
 
 static void *htsp_server, *htsp_server_2;
 
-#define HTSP_PROTO_VERSION 7
+#define HTSP_PROTO_VERSION 8
 
 #define HTSP_ASYNC_OFF  0x00
 #define HTSP_ASYNC_ON   0x01
@@ -369,13 +370,16 @@ htsp_generate_challenge(htsp_connection_t *htsp)
  *
  */
 static htsmsg_t *
-htsp_file_open(htsp_connection_t *htsp, const char *path)
+htsp_file_open(htsp_connection_t *htsp, const char *path, int fd)
 {
   struct stat st;
-  int fd = open(path, O_RDONLY);
-  tvhlog(LOG_DEBUG, "HTSP", "Opening file %s -- %s", path, fd < 0 ? strerror(errno) : "OK");
-  if(fd == -1)
-    return htsp_error("Unable to open file");
+
+  if (fd <= 0) {
+    fd = open(path, O_RDONLY);
+    tvhlog(LOG_DEBUG, "HTSP", "Opening file %s -- %s", path, fd < 0 ? strerror(errno) : "OK");
+    if(fd == -1)
+      return htsp_error("Unable to open file");
+  }
 
   htsp_file_t *hf = calloc(1, sizeof(htsp_file_t));
   hf->hf_fd = fd;
@@ -432,7 +436,7 @@ htsp_file_destroy(htsp_file_t *hf)
  *
  */
 static htsmsg_t *
-htsp_build_channel(channel_t *ch, const char *method)
+htsp_build_channel(channel_t *ch, const char *method, htsp_connection_t *htsp)
 {
   channel_tag_mapping_t *ctm;
   channel_tag_t *ct;
@@ -447,8 +451,30 @@ htsp_build_channel(channel_t *ch, const char *method)
   htsmsg_add_u32(out, "channelNumber", ch->ch_number);
 
   htsmsg_add_str(out, "channelName", ch->ch_name);
-  if(ch->ch_icon != NULL)
-    htsmsg_add_str(out, "channelIcon", ch->ch_icon);
+  if(ch->ch_icon != NULL) {
+    uint32_t id;
+    struct sockaddr_in addr;
+    socklen_t addrlen;
+    if ((id = imagecache_get_id(ch->ch_icon))) {
+      size_t p = 0;
+      char url[256];
+      if (htsp->htsp_version < 8) {
+        addrlen = sizeof(addr);
+        getsockname(htsp->htsp_fd, (struct sockaddr*)&addr, &addrlen);
+        strcpy(url, "http://");
+        p = strlen(url);
+        inet_ntop(AF_INET, &addr.sin_addr, url+p, sizeof(url)-p);
+        p = strlen(url);
+        p += snprintf(url+p, sizeof(url)-p, ":%hd%s",
+                      webui_port,
+                      tvheadend_webroot ?: "");
+      }
+      snprintf(url+p, sizeof(url)-p, "/imagecache/%d", id);
+      htsmsg_add_str(out, "channelIcon", url);
+    } else {
+      htsmsg_add_str(out, "channelIcon", ch->ch_icon);
+    }
+  }
 
   now  = ch->ch_epg_now;
   next = ch->ch_epg_next;
@@ -669,16 +695,17 @@ htsp_build_event
 static htsmsg_t *
 htsp_method_hello(htsp_connection_t *htsp, htsmsg_t *in)
 {
-  htsmsg_t *l, *r = htsmsg_create_map();
+  htsmsg_t *r;
   uint32_t v;
   const char *name;
-  int i = 0;
 
   if(htsmsg_get_u32(in, "htspversion", &v))
     return htsp_error("Missing argument 'htspversion'");
 
   if((name = htsmsg_get_str(in, "clientname")) == NULL)
     return htsp_error("Missing argument 'clientname'");
+
+  r = htsmsg_create_map();
 
   tvh_str_update(&htsp->htsp_clientname, htsmsg_get_str(in, "clientname"));
 
@@ -689,14 +716,11 @@ htsp_method_hello(htsp_connection_t *htsp, htsmsg_t *in)
   htsmsg_add_str(r, "servername", "HTS Tvheadend");
   htsmsg_add_str(r, "serverversion", tvheadend_version);
   htsmsg_add_bin(r, "challenge", htsp->htsp_challenge, 32);
+  if (tvheadend_webroot)
+    htsmsg_add_str(r, "webroot", tvheadend_webroot);
 
   /* Capabilities */
-  l = htsmsg_create_list();
-  while (tvheadend_capabilities[i]) {
-    htsmsg_add_str(l, NULL, tvheadend_capabilities[i]);
-    i++;
-  }
-  htsmsg_add_msg(r, "servercapability", l);
+  htsmsg_add_msg(r, "servercapability", tvheadend_capabilities_list(1));
 
   /* Set version to lowest num */
   htsp->htsp_version = MIN(HTSP_PROTO_VERSION, v);
@@ -798,7 +822,7 @@ htsp_method_async(htsp_connection_t *htsp, htsmsg_t *in)
   
   /* Send all channels */
   RB_FOREACH(ch, &channel_name_tree, ch_name_link)
-    htsp_send_message(htsp, htsp_build_channel(ch, "channelAdd"), NULL);
+    htsp_send_message(htsp, htsp_build_channel(ch, "channelAdd", htsp), NULL);
     
   /* Send all enabled and external tags (now with channel mappings) */
   TAILQ_FOREACH(ct, &channel_tags, ct_link)
@@ -1341,7 +1365,12 @@ htsp_method_file_open(htsp_connection_t *htsp, htsmsg_t *in)
   if((str = htsmsg_get_str(in, "file")) == NULL)
     return htsp_error("Missing argument 'file'");
 
-  if((s2 = tvh_strbegins(str, "dvr/")) != NULL) {
+  // optional leading slash
+  if (*str == '/')
+    str++;
+
+  if((s2 = tvh_strbegins(str, "dvr/")) != NULL ||
+     (s2 = tvh_strbegins(str, "dvrfile/")) != NULL) {
     dvr_entry_t *de = dvr_entry_find_by_id(atoi(s2));
     if(de == NULL)
       return htsp_error("DVR entry does not exist");
@@ -1350,11 +1379,17 @@ htsp_method_file_open(htsp_connection_t *htsp, htsmsg_t *in)
       return htsp_error("DVR entry does not have a file yet");
 
     filename = de->de_filename;
+    return htsp_file_open(htsp, filename, 0);
+
+  } else if ((s2 = tvh_strbegins(str, "imagecache/")) != NULL) {
+    int fd = imagecache_open(atoi(s2));
+    if (fd <= 0)
+      return htsp_error("failed to open image");
+    return htsp_file_open(htsp, NULL, fd);
+
   } else {
     return htsp_error("Unknown file");
   }
-
-  return htsp_file_open(htsp, filename);
 }
 
 /**
@@ -1669,7 +1704,6 @@ static void *
 htsp_write_scheduler(void *aux)
 {
   htsp_connection_t *htsp = aux;
-  int r;
   htsp_msg_q_t *hmq;
   htsp_msg_t *hm;
   void *dptr;
@@ -1706,33 +1740,21 @@ htsp_write_scheduler(void *aux)
 
     pthread_mutex_unlock(&htsp->htsp_out_mutex);
 
-    r = htsmsg_binary_serialize(hm->hm_msg, &dptr, &dlen, INT32_MAX);
+    if (htsmsg_binary_serialize(hm->hm_msg, &dptr, &dlen, INT32_MAX) != 0) {
+      tvhlog(LOG_WARNING, "htsp", "%s: failed to serialize data",
+             htsp->htsp_logname);
+    }
 
     htsp_msg_destroy(hm);
 
-    void *freeme = dptr;
-
-    while(dlen > 0) {
-      r = write(htsp->htsp_fd, dptr, dlen);
-      if(r < 0) {
-        if(errno == EAGAIN || errno == EWOULDBLOCK)
-          continue;
-        tvhlog(LOG_INFO, "htsp", "%s: Write error -- %s",
-               htsp->htsp_logname, strerror(errno));
-        break;
-      }
-      if(r == 0) {
-        tvhlog(LOG_ERR, "htsp", "%s: write() returned 0",
-               htsp->htsp_logname);
-      }
-      dptr += r;
-      dlen -= r;
+    if (tvh_write(htsp->htsp_fd, dptr, dlen)) {
+      tvhlog(LOG_INFO, "htsp", "%s: Write error -- %s",
+             htsp->htsp_logname, strerror(errno));
+      break;
     }
 
-    free(freeme);
+    free(dptr);
     pthread_mutex_lock(&htsp->htsp_out_mutex);
-    if(dlen)
-      break;
   }
   // Shutdown socket to make receive thread terminate entire HTSP connection
 
@@ -1889,12 +1911,20 @@ htsp_channel_update_current(channel_t *ch)
 /**
  * Called from channel.c when a new channel is created
  */
+static void
+_htsp_channel_update(channel_t *ch, const char *msg)
+{
+  htsp_connection_t *htsp;
+  LIST_FOREACH(htsp, &htsp_async_connections, htsp_async_link)
+    if (htsp->htsp_async_mode & HTSP_ASYNC_ON)
+      htsp_send_message(htsp, htsp_build_channel(ch, msg, htsp), NULL);
+}
+
 void
 htsp_channel_add(channel_t *ch)
 {
-  htsp_async_send(htsp_build_channel(ch, "channelAdd"), HTSP_ASYNC_ON);
+  _htsp_channel_update(ch, "channelAdd");
 }
-
 
 /**
  * Called from channel.c when a channel is updated
@@ -1902,9 +1932,8 @@ htsp_channel_add(channel_t *ch)
 void
 htsp_channel_update(channel_t *ch)
 {
-  htsp_async_send(htsp_build_channel(ch, "channelUpdate"), HTSP_ASYNC_ON);
+  _htsp_channel_update(ch, "channelUpdate");
 }
-
 
 /**
  * Called from channel.c when a channel is deleted
@@ -2038,7 +2067,7 @@ const static char frametypearray[PKT_NTYPES] = {
 static void
 htsp_stream_deliver(htsp_subscription_t *hs, th_pkt_t *pkt)
 {
-  htsmsg_t *m, *n;
+  htsmsg_t *m;
   htsp_msg_t *hm;
   htsp_connection_t *htsp = hs->hs_htsp;
   int64_t ts;
@@ -2106,13 +2135,29 @@ htsp_stream_deliver(htsp_subscription_t *hs, th_pkt_t *pkt)
     
     pthread_mutex_lock(&htsp->htsp_out_mutex);
 
-    if(TAILQ_FIRST(&hs->hs_q.hmq_q) == NULL) {
-      htsmsg_add_s64(m, "delay", 0);
-    } else if((hm = TAILQ_FIRST(&hs->hs_q.hmq_q)) != NULL &&
-	      (n = hm->hm_msg) != NULL && !htsmsg_get_s64(n, "dts", &ts) &&
-	      pkt->pkt_dts != PTS_UNSET && ts != PTS_UNSET) {
-      htsmsg_add_s64(m, "delay", pkt->pkt_dts - ts);
+    int64_t min_dts = PTS_UNSET;
+    int64_t max_dts = PTS_UNSET;
+    TAILQ_FOREACH(hm, &hs->hs_q.hmq_q, hm_link) {
+      if(!hm->hm_msg)
+	continue;
+      if(htsmsg_get_s64(hm->hm_msg, "dts", &ts))
+	continue;
+      if(ts == PTS_UNSET)
+	continue;
+  
+      if(min_dts == PTS_UNSET)
+	min_dts = ts;
+      else
+	min_dts = MIN(ts, min_dts);
+
+      if(max_dts == PTS_UNSET)
+	max_dts = ts;
+      else
+	max_dts = MAX(ts, max_dts);
     }
+
+    htsmsg_add_s64(m, "delay", max_dts - min_dts);
+
     pthread_mutex_unlock(&htsp->htsp_out_mutex);
 
     htsmsg_add_u32(m, "Bdrops", hs->hs_dropstats[PKT_B_FRAME]);

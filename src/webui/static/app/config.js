@@ -37,11 +37,17 @@ tvheadend.miscconf = function() {
 	 */
 	var confreader = new Ext.data.JsonReader({
 		root : 'config'
-	}, [ 'muxconfpath', 'language' ]);
+	}, [ 'muxconfpath', 'language',
+       'imagecache_enabled', 'imagecache_ok_period',
+       'imagecache_fail_period']);
 
 	/* ****************************************************************
 	 * Form Fields
 	 * ***************************************************************/
+
+  /*
+   * DVB path
+   */
 
 	var dvbscanPath = new Ext.form.TextField({
 		fieldLabel : 'DVB scan files path',
@@ -49,6 +55,10 @@ tvheadend.miscconf = function() {
 		allowBlank : true,
 		width: 400
 	});
+
+  /*
+   * Language
+   */
 
 	var language = new Ext.ux.ItemSelector({
 		name: 'language',
@@ -64,6 +74,34 @@ tvheadend.miscconf = function() {
 		toLegend: 'Selected',
 		fromLegend: 'Available'
 	});
+
+  /*
+   * Image cache
+   */
+  var imagecacheEnabled = new Ext.form.Checkbox({
+    name: 'imagecache_enabled',
+    fieldLabel: 'Enabled',
+  });
+
+  var imagecacheOkPeriod = new Ext.form.NumberField({
+    name: 'imagecache_ok_period',
+    fieldLabel: 'Re-fetch period (hours)'
+  });
+
+  var imagecacheFailPeriod = new Ext.form.NumberField({
+    name: 'imagecache_fail_period',
+    fieldLabel: 'Re-try period (hours)',
+  });
+
+  var imagecachePanel = new Ext.form.FieldSet({
+    title: 'Image Caching',
+    width: 700,
+    autoHeight: true,
+    collapsible: true,
+    items : [ imagecacheEnabled, imagecacheOkPeriod, imagecacheFailPeriod ]
+  });
+  if (tvheadend.capabilities.indexOf('imagecache') == -1)
+    imagecachePanel.hide();
 
 	/* ****************************************************************
 	 * Form
@@ -95,7 +133,8 @@ tvheadend.miscconf = function() {
 		layout : 'form',
 		defaultType : 'textfield',
 		autoHeight : true,
-		items : [ language, dvbscanPath ],
+		items : [ language, dvbscanPath,
+              imagecachePanel ],
 		tbar : [ saveButton, '->', helpButton ]
 	});
 

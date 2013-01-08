@@ -86,23 +86,19 @@ extjs_root(http_connection_t *hc, const char *remain, void *opaque)
   htsbuf_queue_t *hq = &hc->hc_reply;
 
 #define EXTJSPATH "static/extjs"
-
-  htsbuf_qprintf(hq, "<html>\n"
-		 "<script type=\"text/javascript\" src=\""EXTJSPATH"/adapter/ext/ext-base.js\"></script>\n"
-		 "<script type=\"text/javascript\" src=\""EXTJSPATH"/ext-all-debug.js\"></script>\n"
-		 "<link rel=\"stylesheet\" type=\"text/css\" href=\""EXTJSPATH"/resources/css/ext-all.css\">\n"
-		 "<link rel=\"stylesheet\" type=\"text/css\" href=\"static/livegrid/resources/css/ext-ux-livegrid.css\">\n"
-		 "<link rel=\"stylesheet\" type=\"text/css\" href=\"static/app/ext.css\">\n");
-
-  extjs_exec(hq, "Ext.BLANK_IMAGE_URL = "
-	     "'"EXTJSPATH"/resources/images/default/s.gif';");
-
-#if 0
-  htsbuf_qprintf(hq, 
-		 "<script type='text/javascript' "
-		 "src='http://getfirebug.com/releases/lite/1.2/firebug-lite-compressed.js'></script>");
-#endif
-
+  htsbuf_qprintf(hq, "<html>\n");
+  
+  htsbuf_qprintf(hq, "<script type=\"text/javascript\" src=\""EXTJSPATH"/adapter/ext/ext-base%s.js\"></script>\n"
+                     "<script type=\"text/javascript\" src=\""EXTJSPATH"/ext-all%s.js\"></script>\n"
+                     "<link rel=\"stylesheet\" type=\"text/css\" href=\""EXTJSPATH"/resources/css/ext-all-notheme%s.css\">\n"
+                     "<link rel=\"stylesheet\" type=\"text/css\" href=\""EXTJSPATH"/resources/css/xtheme-blue.css\">\n"
+                     "<link rel=\"stylesheet\" type=\"text/css\" href=\"static/livegrid/resources/css/ext-ux-livegrid.css\">\n"
+                     "<link rel=\"stylesheet\" type=\"text/css\" href=\"static/app/ext.css\">\n",
+                     tvheadend_webui_debug ? "-debug" : "",
+                     tvheadend_webui_debug ? "-debug" : "",
+                     tvheadend_webui_debug ? ""       : "-min");
+  
+  extjs_exec(hq, "Ext.BLANK_IMAGE_URL = " "'"EXTJSPATH"/resources/images/default/s.gif';");
 
   /**
    * Load extjs extensions

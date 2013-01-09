@@ -405,6 +405,7 @@ dvr_thread(void *aux)
   int run = 1;
   int started = 0;
   int comm_skip = (cfg->dvr_flags & DVR_SKIP_COMMERCIALS);
+  int commercial = COMMERCIAL_UNKNOWN;
 
   pthread_mutex_lock(&sq->sq_mutex);
 
@@ -423,13 +424,18 @@ dvr_thread(void *aux)
 
     case SMT_PACKET:
       pkt = sm->sm_data;
-      if(pkt->pkt_commercial == COMMERCIAL_YES) {
+      if(pkt->pkt_commercial == COMMERCIAL_YES)
 	dvr_rec_set_state(de, DVR_RS_COMMERCIAL, 0);
-	tsfix_set_comm_skip(de->de_tsfix, comm_skip);
-      } else {
+      else
 	dvr_rec_set_state(de, DVR_RS_RUNNING, 0);
-	tsfix_set_comm_skip(de->de_tsfix, 0);
-      }
+
+      if(pkt->pkt_commercial == COMMERCIAL_YES && comm_skip)
+	break;
+
+      if(commercial != pkt->pkt_commercial)
+	muxer_add_marker(de->de_mux);
+
+      commercial = pkt->pkt_commercial;
 
       if(started) {
 	muxer_write_pkt(de->de_mux, sm->sm_type, sm->sm_data);

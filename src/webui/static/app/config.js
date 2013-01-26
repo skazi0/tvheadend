@@ -127,7 +127,7 @@ tvheadend.miscconf = function() {
 		border : false,
 		bodyStyle : 'padding:15px',
 		labelAlign : 'left',
-		labelWidth : 150,
+		labelWidth : 200,
 		waitMsgTarget : true,
 		reader : confreader,
 		layout : 'form',

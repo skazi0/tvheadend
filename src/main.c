@@ -61,6 +61,7 @@
 #include "muxes.h"
 #include "config2.h"
 #include "imagecache.h"
+#include "timeshift.h"
 #if ENABLE_LIBAV
 #include "libav.h"
 #endif
@@ -127,6 +128,9 @@ const tvh_caps_t tvheadend_capabilities[] = {
 #endif
 #if ENABLE_IMAGECACHE
   { "imagecache", &imagecache_enabled },
+#endif
+#if ENABLE_TIMESHIFT
+  { "timeshift", &timeshift_enabled },
 #endif
   { NULL, NULL }
 };
@@ -355,7 +359,8 @@ main(int argc, char **argv)
               opt_debug        = 0,
               opt_syslog       = 0,
               opt_uidebug      = 0,
-              opt_abort        = 0;
+              opt_abort        = 0,
+              opt_ipv6         = 0;
   const char *opt_config       = NULL,
              *opt_user         = NULL,
              *opt_group        = NULL,
@@ -383,12 +388,12 @@ main(int argc, char **argv)
 	                      "to your Tvheadend installation until you edit\n"
 	                      "the access-control from within the Tvheadend UI",
       OPT_BOOL, &opt_firstrun },
-#ifdef ENABLE_LINUXDVB
+#if ENABLE_LINUXDVB
     { 'a', "adapters",  "Use only specified DVB adapters",
       OPT_STR, &opt_dvb_adapters },
 #endif
-
     {   0, NULL,         "Server Connectivity",    OPT_BOOL, NULL         },
+    { '6', "ipv6",       "Listen on IPv6",         OPT_BOOL, &opt_ipv6    },
     {   0, "http_port",  "Specify alternative http port",
       OPT_INT, &tvheadend_webui_port },
     {   0, "http_root",  "Specify alternative http webroot",
@@ -598,7 +603,11 @@ main(int argc, char **argv)
   v4l_init();
 #endif
 
-  tcp_server_init();
+#if ENABLE_TIMESHIFT
+  timeshift_init();
+#endif
+
+  tcp_server_init(opt_ipv6);
   http_server_init();
   webui_init();
 
@@ -658,6 +667,10 @@ main(int argc, char **argv)
   mainloop();
 
   epg_save();
+
+#if ENABLE_TIMESHIFT
+  timeshift_term();
+#endif
 
   tvhlog(LOG_NOTICE, "STOP", "Exiting HTS Tvheadend");
 

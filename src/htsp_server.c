@@ -43,6 +43,9 @@
 #include "epg.h"
 #include "plumbing/tsfix.h"
 #include "imagecache.h"
+#if ENABLE_TIMESHIFT
+#include "timeshift.h"
+#endif
 
 #include <sys/statvfs.h>
 #include "settings.h"
@@ -112,7 +115,7 @@ typedef struct htsp_connection {
   LIST_ENTRY(htsp_connection) htsp_link;
 
   int htsp_fd;
-  struct sockaddr_in *htsp_peer;
+  struct sockaddr_storage *htsp_peer;
 
   uint32_t htsp_version;
 
@@ -169,6 +172,10 @@ typedef struct htsp_subscription {
 
   streaming_target_t hs_input;
   streaming_target_t *hs_tsfix;
+
+#if ENABLE_TIMESHIFT
+  streaming_target_t *hs_tshift;
+#endif
 
   htsp_msg_q_t hs_q;
 
@@ -274,6 +281,10 @@ htsp_subscription_destroy(htsp_connection_t *htsp, htsp_subscription_t *hs)
   if(hs->hs_tsfix != NULL)
     tsfix_destroy(hs->hs_tsfix);
   htsp_flush_queue(htsp, &hs->hs_q);
+#if ENABLE_TIMESHIFT
+  if(hs->hs_tshift)
+    timeshift_destroy(hs->hs_tshift);
+#endif
   free(hs);
 }
 
@@ -453,19 +464,22 @@ htsp_build_channel(channel_t *ch, const char *method, htsp_connection_t *htsp)
   htsmsg_add_str(out, "channelName", ch->ch_name);
   if(ch->ch_icon != NULL) {
     uint32_t id;
-    struct sockaddr_in addr;
+    struct sockaddr_storage addr;
     socklen_t addrlen;
     if ((id = imagecache_get_id(ch->ch_icon))) {
       size_t p = 0;
       char url[256];
+      char buf[50];
       if (htsp->htsp_version < 8) {
         addrlen = sizeof(addr);
         getsockname(htsp->htsp_fd, (struct sockaddr*)&addr, &addrlen);
+        tcp_get_ip_str((struct sockaddr*)&addr, buf, 50);
         strcpy(url, "http://");
         p = strlen(url);
-        inet_ntop(AF_INET, &addr.sin_addr, url+p, sizeof(url)-p);
-        p = strlen(url);
-        p += snprintf(url+p, sizeof(url)-p, ":%hd%s",
+        p += snprintf(url+p, sizeof(url)-p, "%s%s%s:%hd%s",
+                      (addr.ss_family == AF_INET6)?"[":"",
+                      buf,
+                      (addr.ss_family == AF_INET6)?"]":"",
                       tvheadend_webui_port,
                       tvheadend_webroot ?: "");
       }
@@ -569,7 +583,9 @@ htsp_build_dvrentry(dvr_entry_t *de, const char *method)
     break;
   case DVR_COMPLETED:
     s = "completed";
-    if(de->de_last_error)
+    if(dvr_get_filesize(de) == -1)
+      error = "File missing";
+    else if(de->de_last_error)
       error = streaming_code2txt(de->de_last_error);
     break;
   case DVR_MISSED_TIME:
@@ -1228,6 +1244,9 @@ static htsmsg_t *
 htsp_method_subscribe(htsp_connection_t *htsp, htsmsg_t *in)
 {
   uint32_t chid, sid, weight, req90khz, normts;
+#if ENABLE_TIMESHIFT
+  uint32_t timeshiftPeriod = 0;
+#endif
   channel_t *ch;
   htsp_subscription_t *hs;
   const char *str;
@@ -1249,6 +1268,14 @@ htsp_method_subscribe(htsp_connection_t *htsp, htsmsg_t *in)
   req90khz = htsmsg_get_u32_or_default(in, "90khz", 0);
   normts = htsmsg_get_u32_or_default(in, "normts", 0);
 
+#if ENABLE_TIMESHIFT
+  if (timeshift_enabled) {
+    timeshiftPeriod = htsmsg_get_u32_or_default(in, "timeshiftPeriod", 0);
+    if (!timeshift_unlimited_period)
+      timeshiftPeriod = MIN(timeshiftPeriod, timeshift_max_period);
+  }
+#endif
+
   /*
    * We send the reply now to avoid the user getting the 'subscriptionStart'
    * async message before the reply to 'subscribe'.
@@ -1262,6 +1289,11 @@ htsp_method_subscribe(htsp_connection_t *htsp, htsmsg_t *in)
     htsmsg_add_u32(rep, "90khz", 1);
   if(normts)
     htsmsg_add_u32(rep, "normts", 1);
+
+#if ENABLE_TIMESHIFT
+  if(timeshiftPeriod)
+    htsmsg_add_u32(rep, "timeshiftPeriod", timeshiftPeriod);
+#endif
 
   htsp_reply(htsp, in, rep);
 
@@ -1279,14 +1311,20 @@ htsp_method_subscribe(htsp_connection_t *htsp, htsmsg_t *in)
   LIST_INSERT_HEAD(&htsp->htsp_subscriptions, hs, hs_link);
   streaming_target_init(&hs->hs_input, htsp_streaming_input, hs, 0);
 
-  streaming_target_t *st;
+  streaming_target_t *st = &hs->hs_input;
 
-  if(normts) {
-    hs->hs_tsfix = tsfix_create(&hs->hs_input);
-    st = hs->hs_tsfix;
-  } else {
-    st = &hs->hs_input;
+#if ENABLE_TIMESHIFT
+  if (timeshiftPeriod != 0) {
+    if (timeshiftPeriod == ~0)
+      tvhlog(LOG_DEBUG, "htsp", "using timeshift buffer (unlimited)");
+    else
+      tvhlog(LOG_DEBUG, "htsp", "using timeshift buffer (%u mins)", timeshiftPeriod / 60);
+    st = hs->hs_tshift = timeshift_create(st, timeshiftPeriod);
+    normts = 1;
   }
+#endif
+  if(normts)
+    st = hs->hs_tsfix = tsfix_create(st);
 
   hs->hs_s = subscription_create_from_channel(ch, weight,
 					      htsp->htsp_logname,
@@ -1353,6 +1391,72 @@ htsp_method_change_weight(htsp_connection_t *htsp, htsmsg_t *in)
   return NULL;
 }
 
+/**
+ * Skip stream
+ */
+static htsmsg_t *
+htsp_method_skip(htsp_connection_t *htsp, htsmsg_t *in)
+{
+  htsp_subscription_t *hs;
+  uint32_t sid, abs;
+  int64_t s64;
+  streaming_skip_t skip;
+
+  if(htsmsg_get_u32(in, "subscriptionId", &sid))
+    return htsp_error("Missing argument 'subscriptionId'");
+
+  LIST_FOREACH(hs, &htsp->htsp_subscriptions, hs_link)
+    if(hs->hs_sid == sid)
+      break;
+
+  if(hs == NULL)
+    return htsp_error("Requested subscription does not exist");
+
+  abs = htsmsg_get_u32_or_default(in, "absolute", 0);
+
+  if(!htsmsg_get_s64(in, "time", &s64)) {
+    skip.type = abs ? SMT_SKIP_ABS_TIME : SMT_SKIP_REL_TIME;
+    skip.time = hs->hs_90khz ? s64 : ts_rescale_i(s64, 1000000);
+  } else if (!htsmsg_get_s64(in, "size", &s64)) {
+    skip.type = abs ? SMT_SKIP_ABS_SIZE : SMT_SKIP_REL_SIZE;
+    skip.size = s64;
+  } else {
+    return htsp_error("Missing argument 'time' or 'size'");
+  }
+
+  subscription_set_skip(hs->hs_s, &skip);
+
+  htsp_reply(htsp, in, htsmsg_create_map());
+  return NULL;
+}
+
+/*
+ * Set stream speed
+ */
+static htsmsg_t *
+htsp_method_speed(htsp_connection_t *htsp, htsmsg_t *in)
+{
+  htsp_subscription_t *hs;
+  uint32_t sid;
+  int32_t speed;
+
+  if(htsmsg_get_u32(in, "subscriptionId", &sid))
+    return htsp_error("Missing argument 'subscriptionId'");
+  if(htsmsg_get_s32(in, "speed", &speed))
+    return htsp_error("Missing argument 'speed'");
+
+  LIST_FOREACH(hs, &htsp->htsp_subscriptions, hs_link)
+    if(hs->hs_sid == sid)
+      break;
+
+  if(hs == NULL)
+    return htsp_error("Requested subscription does not exist");
+
+  subscription_set_speed(hs->hs_s, speed);
+
+  htsp_reply(htsp, in, htsmsg_create_map());
+  return NULL;
+}
 
 /**
  * Open file
@@ -1529,6 +1633,9 @@ struct {
   { "subscribe",                htsp_method_subscribe,      ACCESS_STREAMING},
   { "unsubscribe",              htsp_method_unsubscribe,    ACCESS_STREAMING},
   { "subscriptionChangeWeight", htsp_method_change_weight,  ACCESS_STREAMING},
+  { "subscriptionSeek",         htsp_method_skip,           ACCESS_STREAMING},
+  { "subscriptionSkip",         htsp_method_skip,           ACCESS_STREAMING},
+  { "subscriptionSpeed",        htsp_method_speed,          ACCESS_STREAMING},
   { "fileOpen",                 htsp_method_file_open,      ACCESS_RECORDER},
   { "fileRead",                 htsp_method_file_read,      ACCESS_RECORDER},
   { "fileClose",                htsp_method_file_close,     ACCESS_RECORDER},
@@ -1767,14 +1874,14 @@ htsp_write_scheduler(void *aux)
  *
  */
 static void
-htsp_serve(int fd, void *opaque, struct sockaddr_in *source,
-	   struct sockaddr_in *self)
+htsp_serve(int fd, void *opaque, struct sockaddr_storage *source,
+	   struct sockaddr_storage *self)
 {
   htsp_connection_t htsp;
-  char buf[30];
+  char buf[50];
   htsp_subscription_t *s;
 
-  snprintf(buf, sizeof(buf), "%s", inet_ntoa(source->sin_addr));
+  tcp_get_ip_str((struct sockaddr*)source, buf, 50);
 
   memset(&htsp, 0, sizeof(htsp_connection_t));
 
@@ -2093,7 +2200,6 @@ htsp_stream_deliver(htsp_subscription_t *hs, th_pkt_t *pkt)
   htsmsg_add_u32(m, "stream", pkt->pkt_componentindex);
   htsmsg_add_u32(m, "com", pkt->pkt_commercial);
 
-
   if(pkt->pkt_pts != PTS_UNSET) {
     int64_t pts = hs->hs_90khz ? pkt->pkt_pts : ts_rescale(pkt->pkt_pts, 1000000);
     htsmsg_add_s64(m, "pts", pts);
@@ -2309,13 +2415,67 @@ htsp_subscription_signal_status(htsp_subscription_t *hs, signal_status_t *sig)
  *
  */
 static void
+htsp_subscription_speed(htsp_subscription_t *hs, int speed)
+{
+  htsmsg_t *m = htsmsg_create_map();
+  htsmsg_add_str(m, "method", "subscriptionSpeed");
+  htsmsg_add_u32(m, "subscriptionId", hs->hs_sid);
+  htsmsg_add_u32(m, "speed", speed);
+  htsp_send(hs->hs_htsp, m, NULL, &hs->hs_q, 0);
+}
+
+/**
+ *
+ */
+static void
+htsp_subscription_skip(htsp_subscription_t *hs, streaming_skip_t *skip)
+{
+  htsmsg_t *m = htsmsg_create_map();
+  htsmsg_add_str(m, "method", "subscriptionSkip");
+  htsmsg_add_u32(m, "subscriptionId", hs->hs_sid);
+  if (skip->type == SMT_SKIP_ABS_TIME || skip->type == SMT_SKIP_ABS_SIZE)
+    htsmsg_add_u32(m, "absolute", 1);
+  if (skip->type == SMT_SKIP_ERROR)
+    htsmsg_add_u32(m, "error", 1);
+  else if (skip->type == SMT_SKIP_ABS_TIME || skip->type == SMT_SKIP_REL_TIME)
+    htsmsg_add_s64(m, "time", hs->hs_90khz ? skip->time : ts_rescale(skip->time, 1000000));
+  else if (skip->type == SMT_SKIP_ABS_SIZE || skip->type == SMT_SKIP_REL_SIZE)
+    htsmsg_add_s64(m, "size", skip->size);
+  htsp_send(hs->hs_htsp, m, NULL, &hs->hs_q, 0);
+}
+
+/**
+ *
+ */
+#if ENABLE_TIMESHIFT
+static void
+htsp_subscription_timeshift_status(htsp_subscription_t *hs, timeshift_status_t *status)
+{
+  htsmsg_t *m = htsmsg_create_map();
+  htsmsg_add_str(m, "method", "timeshiftStatus");
+  htsmsg_add_u32(m, "subscriptionId", hs->hs_sid);
+  htsmsg_add_u32(m, "full", status->full);
+  htsmsg_add_s64(m, "shift", hs->hs_90khz ? status->shift : ts_rescale(status->shift, 1000000));
+  if (status->pts_start != PTS_UNSET)
+    htsmsg_add_s64(m, "start", hs->hs_90khz ? status->pts_start : ts_rescale(status->pts_start, 1000000)) ;
+  if (status->pts_end != PTS_UNSET)
+    htsmsg_add_s64(m, "end", hs->hs_90khz ? status->pts_end : ts_rescale(status->pts_end, 1000000)) ;
+  htsp_send(hs->hs_htsp, m, NULL, &hs->hs_q, 0);
+}
+#endif
+
+/**
+ *
+ */
+static void
 htsp_streaming_input(void *opaque, streaming_message_t *sm)
 {
   htsp_subscription_t *hs = opaque;
 
   switch(sm->sm_type) {
   case SMT_PACKET:
-    htsp_stream_deliver(hs, sm->sm_data); // reference is transfered
+    htsp_stream_deliver(hs, sm->sm_data);
+    // reference is transfered
     sm->sm_data = NULL;
     break;
 
@@ -2344,6 +2504,20 @@ htsp_streaming_input(void *opaque, streaming_message_t *sm)
 
   case SMT_EXIT:
     abort();
+
+  case SMT_SKIP:
+    htsp_subscription_skip(hs, sm->sm_data);
+    break;
+
+  case SMT_SPEED:
+    htsp_subscription_speed(hs, sm->sm_code);
+    break;
+
+  case SMT_TIMESHIFT_STATUS:
+#if ENABLE_TIMESHIFT
+    htsp_subscription_timeshift_status(hs, sm->sm_data);
+#endif
+    break;
   }
   streaming_msg_free(sm);
 }

@@ -48,6 +48,7 @@
 #include "lang_codes.h"
 #include "subscriptions.h"
 #include "imagecache.h"
+#include "timeshift.h"
 
 /**
  *
@@ -87,6 +88,11 @@ extjs_root(http_connection_t *hc, const char *remain, void *opaque)
 
 #define EXTJSPATH "static/extjs"
   htsbuf_qprintf(hq, "<html>\n");
+  htsbuf_qprintf(hq, "<head>\n");
+
+  // Issue #1504 - IE9 temporary fix
+  htsbuf_qprintf(hq, "<meta http-equiv=\"X-UA-Compatible\" content=\"IE=8\">\n");
+
   
   htsbuf_qprintf(hq, "<script type=\"text/javascript\" src=\""EXTJSPATH"/adapter/ext/ext-base%s.js\"></script>\n"
                      "<script type=\"text/javascript\" src=\""EXTJSPATH"/ext-all%s.js\"></script>\n"
@@ -130,6 +136,9 @@ extjs_root(http_connection_t *hc, const char *remain, void *opaque)
   extjs_load(hq, "static/app/iptv.js");
 #if ENABLE_V4L
   extjs_load(hq, "static/app/v4l.js");
+#endif
+#if ENABLE_TIMESHIFT
+  extjs_load(hq, "static/app/timeshift.js");
 #endif
   extjs_load(hq, "static/app/chconf.js");
   extjs_load(hq, "static/app/epg.js");
@@ -285,10 +294,10 @@ extjs_tablemgr(http_connection_t *hc, const char *remain, void *opaque)
   if(in != NULL)
     htsmsg_destroy(in);
 
-  if(out != NULL) {
-    htsmsg_json_serialize(out, hq, 0);
-    htsmsg_destroy(out);
-  }
+  if(out == NULL)
+    out = htsmsg_create_map();
+  htsmsg_json_serialize(out, hq, 0);
+  htsmsg_destroy(out);
   http_output_content(hc, "text/x-json; charset=UTF-8");
   return 0;
 }
@@ -1344,7 +1353,7 @@ extjs_dvrlist(http_connection_t *hc, const char *remain, void *opaque,
   dvr_entry_t *de;
   int start = 0, end, limit, i;
   const char *s;
-  off_t fsize;
+  int64_t fsize = 0;
   char buf[100];
 
   if((s = http_arg_get(&hc->hc_req_args, "start")) != NULL)
@@ -1414,15 +1423,13 @@ extjs_dvrlist(http_connection_t *hc, const char *remain, void *opaque,
 
     if(de->de_sched_state == DVR_COMPLETED) {
       fsize = dvr_get_filesize(de);
-      if(fsize > 0) {
-	char url[100];
-	htsmsg_add_s64(m, "filesize", fsize);
-
-	snprintf(url, sizeof(url), "dvrfile/%d", de->de_id);
-	htsmsg_add_str(m, "url", url);
+      if (fsize > 0) {
+        char url[100];
+        htsmsg_add_s64(m, "filesize", fsize);
+        snprintf(url, sizeof(url), "dvrfile/%d", de->de_id);
+        htsmsg_add_str(m, "url", url);
       }
     }
-
 
     htsmsg_add_msg(array, NULL, m);
   }
@@ -1442,7 +1449,7 @@ extjs_dvrlist(http_connection_t *hc, const char *remain, void *opaque,
 static int is_dvr_entry_finished(dvr_entry_t *entry)
 {
   dvr_entry_sched_state_t state = entry->de_sched_state;
-  return state == DVR_COMPLETED;
+  return state == DVR_COMPLETED && !entry->de_last_error && dvr_get_filesize(entry) != -1;
 }
 
 static int is_dvr_entry_upcoming(dvr_entry_t *entry)
@@ -1454,8 +1461,11 @@ static int is_dvr_entry_upcoming(dvr_entry_t *entry)
 
 static int is_dvr_entry_failed(dvr_entry_t *entry)
 {
-  dvr_entry_sched_state_t state = entry->de_sched_state;
-  return state == DVR_MISSED_TIME || state == DVR_NOSTATE;
+  if (is_dvr_entry_finished(entry))
+    return 0;
+  if (is_dvr_entry_upcoming(entry))
+    return 0;
+  return 1;
 }
 
 static int
@@ -2046,6 +2056,79 @@ extjs_capabilities(http_connection_t *hc, const char *remain, void *opaque)
 }
 
 /**
+ *
+ */
+#if ENABLE_TIMESHIFT
+static int
+extjs_timeshift(http_connection_t *hc, const char *remain, void *opaque)
+{
+  htsbuf_queue_t *hq = &hc->hc_reply;
+  const char *op = http_arg_get(&hc->hc_req_args, "op");
+  htsmsg_t *out, *m;
+  const char *str;
+
+  if(op == NULL)
+    return 400;
+
+  pthread_mutex_lock(&global_lock);
+
+  if(http_access_verify(hc, ACCESS_ADMIN)) {
+    pthread_mutex_unlock(&global_lock);
+    return HTTP_STATUS_UNAUTHORIZED;
+  }
+
+  pthread_mutex_unlock(&global_lock);
+
+  /* Basic settings (not the advanced schedule) */
+  if(!strcmp(op, "loadSettings")) {
+    pthread_mutex_lock(&global_lock);
+    m = htsmsg_create_map();
+    htsmsg_add_u32(m, "timeshift_enabled",  timeshift_enabled);
+    htsmsg_add_u32(m, "timeshift_ondemand", timeshift_ondemand);
+    if (timeshift_path)
+      htsmsg_add_str(m, "timeshift_path", timeshift_path);
+    htsmsg_add_u32(m, "timeshift_unlimited_period", timeshift_unlimited_period);
+    htsmsg_add_u32(m, "timeshift_max_period", timeshift_max_period / 60);
+    htsmsg_add_u32(m, "timeshift_unlimited_size", timeshift_unlimited_size);
+    htsmsg_add_u32(m, "timeshift_max_size", timeshift_max_size / 1048576);
+    pthread_mutex_unlock(&global_lock);
+    out = json_single_record(m, "config");
+
+  /* Save settings */
+  } else if (!strcmp(op, "saveSettings") ) {
+    pthread_mutex_lock(&global_lock);
+    timeshift_enabled  = http_arg_get(&hc->hc_req_args, "timeshift_enabled")  ? 1 : 0;
+    timeshift_ondemand = http_arg_get(&hc->hc_req_args, "timeshift_ondemand") ? 1 : 0;
+    if ((str = http_arg_get(&hc->hc_req_args, "timeshift_path"))) {
+      if (timeshift_path)
+        free(timeshift_path);
+      timeshift_path = strdup(str);
+    }
+    timeshift_unlimited_period = http_arg_get(&hc->hc_req_args, "timeshift_unlimited_period") ? 1 : 0;
+    if ((str = http_arg_get(&hc->hc_req_args, "timeshift_max_period")))
+      timeshift_max_period = (uint32_t)atol(str) * 60;
+    timeshift_unlimited_size = http_arg_get(&hc->hc_req_args, "timeshift_unlimited_size") ? 1 : 0;
+    if ((str = http_arg_get(&hc->hc_req_args, "timeshift_max_size")))
+      timeshift_max_size   = atol(str) * 1048576LL;
+    timeshift_save();
+    pthread_mutex_unlock(&global_lock);
+
+    out = htsmsg_create_map();
+    htsmsg_add_u32(out, "success", 1);
+
+  } else {
+    return HTTP_STATUS_BAD_REQUEST;
+  }
+
+  htsmsg_json_serialize(out, hq, 0);
+  htsmsg_destroy(out);
+  http_output_content(hc, "text/x-json; charset=UTF-8");
+
+  return 0;
+}
+#endif
+
+/**
  * WEB user interface
  */
 void
@@ -2075,6 +2158,9 @@ extjs_start(void)
   http_path_add("/iptv/services",    NULL, extjs_iptvservices,     ACCESS_ADMIN);
   http_path_add("/servicedetails",   NULL, extjs_servicedetails,   ACCESS_ADMIN);
   http_path_add("/tv/adapter",       NULL, extjs_tvadapter,        ACCESS_ADMIN);
+#if ENABLE_TIMESHIFT
+  http_path_add("/timeshift",        NULL, extjs_timeshift,        ACCESS_ADMIN);
+#endif
 
 #if ENABLE_LINUXDVB
   extjs_start_dvb();

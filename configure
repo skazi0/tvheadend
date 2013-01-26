@@ -20,10 +20,12 @@ OPTIONS=(
   "v4l:yes"
   "linuxdvb:yes"
   "dvbscan:yes"
+  "timeshift:yes"
   "imagecache:auto"
   "avahi:auto"
   "zlib:auto"
   "libav:auto"
+  "inotify:auto"
   "bundle:no"
   "dvbcsa:no"
 )
@@ -38,6 +40,8 @@ parse_args $*
 # ###########################################################################
 # Checks
 # ###########################################################################
+
+echo "Checking support/features"
 
 #
 # Compiler
@@ -107,6 +111,14 @@ fi
 if enabled_or_auto libav; then
   has_libav=true
 
+  if $has_libav && ! check_pkg libavcodec "<=55.0.0"; then
+    has_libav=false
+  fi
+
+  if $has_libav && ! check_pkg libavcodec ">=52.96.0"; then
+    has_libav=false
+  fi
+
   if $has_libav && ! check_pkg libavutil ">=50.43.0"; then
     has_libav=false
   fi
@@ -115,7 +127,7 @@ if enabled_or_auto libav; then
     has_libav=false
   fi
 
-  if $has_libav && ! check_pkg libavformat ">=50.43.0"; then
+  if $has_libav && ! check_pkg libavformat ">=53.10.0"; then
     has_libav=false
   fi
 
@@ -126,22 +138,14 @@ if enabled_or_auto libav; then
   fi
 fi
 
-
 #
-# DVB scan
+# Inotify
 #
-if enabled linuxdvb && enabled dvbscan; then
-  if [ ! -d ${ROOTDIR}/data/dvb-scan ]; then
-    if ! enabled bin_bzip2; then
-      die "Bzip2 not found, fetch dvb-scan files (use --disable-dvbscan)"
-    fi
-    echo -n "Fetching dvb-scan files... "
-    if ${ROOTDIR}/support/getmuxlist &> /dev/null; then
-      echo "done"
-    else
-      echo
-      die "Failed to fetch dvb-scan files (use --disable-dvbscan to skip)"
-    fi
+if enabled_or_auto inotify; then
+  if check_cc_header "sys/inotify" inotify_h; then
+    enable inotify
+  elif enabled inotify; then
+    die "Inotify support not found (use --disable-inotify)"
   fi
 fi
 
@@ -164,6 +168,25 @@ if enabled_or_auto imagecache; then
   elif enabled imagecache; then
     die "Libcurl support not found (use --disable-imagecache)"
   fi  
+fi
+
+#
+# DVB scan
+#
+if enabled linuxdvb && enabled dvbscan; then
+  printf "${TAB}" "fetching dvb-scan files ..."
+  if [ -d ${ROOTDIR}/data/dvb-scan/.git ]; then
+    (cd ${ROOTDIR}/data/dvb-scan; git pull) &> /dev/null
+  else
+    rm -rf ${ROOTDIR}/data/dvb-scan &> /dev/null
+    URL=git://linuxtv.org/dtv-scan-tables.git
+    git clone $URL ${ROOTDIR}/data/dvb-scan &> /dev/null
+    if [ $? -ne 0 ]; then
+      echo "fail"
+      die "Failed to fetch dvb-scan data (use --disable-dvbscan)"
+    fi
+  fi
+  echo "ok"
 fi
 
 # ###########################################################################

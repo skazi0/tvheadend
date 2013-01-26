@@ -242,6 +242,8 @@ tvheadend.VLC = function(url) {
  */
 function accessUpdate(o) {
   tvheadend.accessUpdate = o;
+  if (!tvheadend.capabilities)
+    return;
 
 	if (o.dvr == true && tvheadend.dvrpanel == null) {
 		tvheadend.dvrpanel = new tvheadend.dvr;
@@ -260,8 +262,6 @@ function accessUpdate(o) {
 				new tvheadend.iptv, new tvheadend.acleditor ]
 		});
 		tvheadend.rootTabPanel.add(tvheadend.confpanel);
-	}
-  if (tvheadend.capabilities && tvheadend.confpanel) {
     if (tvheadend.capabilities.indexOf('linuxdvb') != -1 ||
         tvheadend.capabilities.indexOf('v4l')      != -1) {
       tvheadend.confpanel.add(new tvheadend.tvadapters);
@@ -269,6 +269,9 @@ function accessUpdate(o) {
     if (tvheadend.capabilities.indexOf('cwc')      != -1) {
       tvheadend.confpanel.add(new tvheadend.cwceditor);
       tvheadend.confpanel.add(new tvheadend.capmteditor);
+    }
+    if (tvheadend.capabilities.indexOf('timeshift') != -1) {
+      tvheadend.confpanel.add(new tvheadend.timeshift);
     }
     tvheadend.confpanel.doLayout();
   }

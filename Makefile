@@ -52,9 +52,9 @@ MKBUNDLE = $(PYTHON) $(CURDIR)/support/mkbundle
 #
 
 ifndef V
-ECHO   = printf "$(1)\t\t%s\n" $(2)
+ECHO   = printf "%-16s%s\n" $(1) $(2)
 BRIEF  = CC MKBUNDLE CXX
-MSG    = $@
+MSG    = $(subst $(CURDIR)/,,$@)
 $(foreach VAR,$(BRIEF), \
     $(eval $(VAR) = @$$(call ECHO,$(VAR),$$(MSG)); $($(VAR))))
 endif
@@ -122,7 +122,7 @@ SRCS-$(CONFIG_LINUXDVB) += src/epggrab/otamux.c\
   src/epggrab/support/freesat_huffman.c \
 
 SRCS += src/plumbing/tsfix.c \
-	src/plumbing/globalheaders.c \
+	src/plumbing/globalheaders.c
 
 SRCS += src/dvr/dvr_db.c \
 	src/dvr/dvr_rec.c \
@@ -145,6 +145,13 @@ SRCS += src/muxer.c \
 # Optional code
 #
 
+# Timeshift
+SRCS-${CONFIG_TIMESHIFT} += \
+  src/timeshift.c \
+  src/timeshift/timeshift_filemgr.c \
+  src/timeshift/timeshift_writer.c \
+  src/timeshift/timeshift_reader.c \
+
 # DVB
 SRCS-${CONFIG_LINUXDVB} += \
 	src/dvb/dvb.c \
@@ -162,6 +169,10 @@ SRCS-${CONFIG_LINUXDVB} += \
 	src/dvb/dvb_input_raw.c \
 	src/webui/extjs_dvb.c \
 	src/muxes.c \
+
+# Inotify
+SRCS-${CONFIG_INOTIFY} += \
+  src/dvr/dvr_inotify.c \
 
 # V4L
 SRCS-${CONFIG_V4L} += \
@@ -221,10 +232,20 @@ DEPS       = ${OBJS:%.o=%.d}
 all: ${PROG}
 
 # Special
-.PHONY:	clean distclean
+.PHONY:	clean distclean check_config reconfigure
+
+# Check configure output is valid
+check_config:
+	@test $(CURDIR)/.config.mk -nt $(CURDIR)/configure\
+		|| echo "./configure output is old, please re-run"
+	@test $(CURDIR)/.config.mk -nt $(CURDIR)/configure
+
+# Recreate configuration
+reconfigure:
+	$(CURDIR)/configure $(CONFIGURE_ARGS)
 
 # Binary
-${PROG}: $(OBJS) $(ALLDEPS)
+${PROG}: check_config $(OBJS) $(ALLDEPS)
 	$(CC) -o $@ $(OBJS) $(CFLAGS) $(LDFLAGS)
 
 # Object

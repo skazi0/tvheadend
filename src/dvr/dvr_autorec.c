@@ -390,7 +390,8 @@ autorec_record_update(void *opaque, const char *id, htsmsg_t *values,
     }
   }
 
-  dae->dae_content_type.code = htsmsg_get_u32_or_default(values, "contenttype", 0);
+  if (!htsmsg_get_u32(values, "contenttype", &u32))
+    dae->dae_content_type.code = u32;
 
   if((s = htsmsg_get_str(values, "approx_time")) != NULL) {
     if(strchr(s, ':') != NULL) {
@@ -559,9 +560,11 @@ void dvr_autorec_add_series_link
   ( const char *dvr_config_name, epg_broadcast_t *event,
     const char *creator, const char *comment )
 {
+  char *title;
   if (!event || !event->episode) return;
+  title = regexp_escape(epg_broadcast_get_title(event, NULL));
   _dvr_autorec_add(dvr_config_name,
-                   epg_broadcast_get_title(event, NULL),
+                   title,
                    event->channel,
                    NULL, 0, // tag/content type
                    NULL,
@@ -569,6 +572,8 @@ void dvr_autorec_add_series_link
                    event->serieslink,
                    0, NULL,
                    creator, comment);
+  if (title)
+    free(title);
 }
 
 

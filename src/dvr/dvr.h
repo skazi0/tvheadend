@@ -114,6 +114,8 @@ typedef struct dvr_entry {
   channel_t *de_channel;
   LIST_ENTRY(dvr_entry) de_channel_link;
 
+  char *de_channel_name;
+
   gtimer_t de_timer;
 
   /**
@@ -198,6 +200,7 @@ typedef struct dvr_entry {
 
 } dvr_entry_t;
 
+#define DVR_CH_NAME(e) ((e)->de_channel == NULL ? (e)->de_channel_name : (e)-> de_channel->ch_name)
 
 /**
  * Autorec entry

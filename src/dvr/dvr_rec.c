@@ -32,6 +32,7 @@
 #include "service.h"
 #include "plumbing/tsfix.h"
 #include "plumbing/globalheaders.h"
+#include "htsp_server.h"
 
 #include "muxer.h"
 
@@ -125,12 +126,11 @@ cleanupfilename(char *s, int dvr_flags)
 {
   int i, len = strlen(s);
   for(i = 0; i < len; i++) { 
-    if(s[i] == '/' || s[i] == ':' || s[i] == '\\' || s[i] == '<' ||
-       s[i] == '>' || s[i] == '|' || s[i] == '*' || s[i] == '?')
-      s[i] = '-';
-
-    if((dvr_flags & DVR_WHITESPACE_IN_TITLE) && s[i] == ' ')
+    if((dvr_flags & DVR_WHITESPACE_IN_TITLE) && (s[i] == ' ' || s[i] == '\t'))
       s[i] = '-';	
+
+    if((s[i] < 32) || (s[i] > 122) || (strchr("/:\\<>|*?'\"", s[i]) != NULL))
+      s[i] = '-';
   }
 }
 
@@ -176,7 +176,7 @@ pvr_generate_filename(dvr_entry_t *de, const streaming_start_t *ss)
 
   if(cfg->dvr_flags & DVR_DIR_PER_CHANNEL) {
 
-    char *chname = strdup(de->de_channel->ch_name);
+    char *chname = strdup(DVR_CH_NAME(de));
     cleanupfilename(chname,cfg->dvr_flags);
     snprintf(path + strlen(path), sizeof(path) - strlen(path), 
 	     "/%s", chname);
@@ -465,11 +465,15 @@ dvr_thread(void *aux)
       }
 
       if(!started) {
-	pthread_mutex_lock(&global_lock);
-	dvr_rec_set_state(de, DVR_RS_WAIT_PROGRAM_START, 0);
-	if(dvr_rec_start(de, sm->sm_data) == 0)
-	  started = 1;
-	pthread_mutex_unlock(&global_lock);
+        pthread_mutex_lock(&global_lock);
+        dvr_rec_set_state(de, DVR_RS_WAIT_PROGRAM_START, 0);
+        if(dvr_rec_start(de, sm->sm_data) == 0) {
+          started = 1;
+          dvr_entry_notify(de);
+          htsp_dvr_entry_update(de);
+          dvr_entry_save(de);
+        }
+        pthread_mutex_unlock(&global_lock);
       } 
       break;
 
@@ -588,7 +592,7 @@ dvr_spawn_postproc(dvr_entry_t *de, const char *dvr_postproc)
   memset(fmap, 0, sizeof(fmap));
   fmap['f'] = de->de_filename; /* full path to recoding */
   fmap['b'] = basename(fbasename); /* basename of recoding */
-  fmap['c'] = de->de_channel->ch_name; /* channel name */
+  fmap['c'] = DVR_CH_NAME(de); /* channel name */
   fmap['C'] = de->de_creator; /* user who created this recording */
   fmap['t'] = lang_str_get(de->de_title, NULL); /* program title */
   fmap['d'] = lang_str_get(de->de_desc, NULL); /* program description */
@@ -624,6 +628,6 @@ dvr_thread_epilog(dvr_entry_t *de)
   de->de_mux = NULL;
 
   dvr_config_t *cfg = dvr_config_find_by_name_default(de->de_config_name);
-  if(cfg->dvr_postproc)
+  if(cfg->dvr_postproc && de->de_filename)
     dvr_spawn_postproc(de,cfg->dvr_postproc);
 }

@@ -265,6 +265,8 @@ typedef struct th_dvb_adapter {
 
   int tda_rawmode;
 
+  int tda_bytes;
+
   // Full mux streaming, protected via the delivery mutex
 
   streaming_pad_t tda_streaming_pad;
@@ -425,13 +427,13 @@ th_dvb_mux_instance_t *dvb_mux_create(th_dvb_adapter_t *tda,
 				      uint16_t onid, uint16_t tsid, const char *network,
 				      const char *logprefix, int enabled,
 				      int initialscan, const char *identifier,
-				      dvb_satconf_t *satconf);
+				      dvb_satconf_t *satconf, int create);
 
 void dvb_mux_set_networkname(th_dvb_mux_instance_t *tdmi, const char *name);
 
-void dvb_mux_set_tsid(th_dvb_mux_instance_t *tdmi, uint16_t tsid);
+void dvb_mux_set_tsid(th_dvb_mux_instance_t *tdmi, uint16_t tsid, int force);
 
-void dvb_mux_set_onid(th_dvb_mux_instance_t *tdmi, uint16_t onid);
+void dvb_mux_set_onid(th_dvb_mux_instance_t *tdmi, uint16_t onid, int force);
 
 void dvb_mux_set_enable(th_dvb_mux_instance_t *tdmi, int enabled);
 

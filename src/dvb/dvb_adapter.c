@@ -47,6 +47,7 @@
 #include "service.h"
 #include "epggrab.h"
 #include "diseqc.h"
+#include "atomic.h"
 
 struct th_dvb_adapter_queue dvb_adapters;
 struct th_dvb_mux_instance_tree dvb_muxes;
@@ -59,6 +60,7 @@ static void tda_init(th_dvb_adapter_t *tda);
 static const char* dvb_adapter_snr_whitelist[] = {
   "Sony CXD2820R",
   "stv090x",
+  "TurboSight",
   NULL
 };
 
@@ -1056,6 +1058,7 @@ dvb_adapter_input_dvr(void *aux)
       }
     }
     r += c;
+    atomic_add(&tda->tda_bytes, c);
 
     /* not enough data */
     if (r < 188) continue;

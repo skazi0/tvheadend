@@ -1239,6 +1239,9 @@ dvb_mux_copy(th_dvb_adapter_t *dst, th_dvb_mux_instance_t *tdmi_src,
     if(t_src->s_dvb_charset != NULL)
       t_dst->s_dvb_charset = strdup(t_src->s_dvb_charset);
 
+    if(t_src->s_dvb_eit_keyword != NULL && *t_src->s_dvb_eit_keyword != 0)
+      t_dst->s_dvb_eit_keyword = strdup(t_src->s_dvb_eit_keyword);
+
     if(t_src->s_ch != NULL)
       service_map_channel(t_dst, t_src->s_ch, 0);
 

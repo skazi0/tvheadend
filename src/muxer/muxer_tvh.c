@@ -210,7 +210,7 @@ tvh_muxer_destroy(muxer_t *m)
   tvh_muxer_t *tm = (tvh_muxer_t*)m;
 
   if(tm->tm_ref)
-    free(tm->tm_ref);
+    mk_mux_destroy(tm->tm_ref);
 
   free(tm);
 }
@@ -220,11 +220,11 @@ tvh_muxer_destroy(muxer_t *m)
  * Create a new builtin muxer
  */
 muxer_t*
-tvh_muxer_create(muxer_container_type_t mc)
+tvh_muxer_create(muxer_container_type_t mc, const muxer_config_t *m_cfg)
 {
   tvh_muxer_t *tm;
 
-  if(mc != MC_MATROSKA)
+  if(mc != MC_MATROSKA && mc != MC_WEBM)
     return NULL;
 
   tm = calloc(1, sizeof(tvh_muxer_t));
@@ -239,7 +239,7 @@ tvh_muxer_create(muxer_container_type_t mc)
   tm->m_close        = tvh_muxer_close;
   tm->m_destroy      = tvh_muxer_destroy;
   tm->m_container    = mc;
-  tm->tm_ref         = mk_mux_create();
+  tm->tm_ref         = mk_mux_create((muxer_t *)tm, mc == MC_WEBM);
 
   return (muxer_t*)tm;
 }

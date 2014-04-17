@@ -62,6 +62,9 @@ streaming_component_type2codec_id(streaming_component_type_t type)
   case SCT_MPEG2VIDEO:
     codec_id = CODEC_ID_MPEG2VIDEO;
     break;
+  case SCT_VP8:
+    codec_id = CODEC_ID_VP8;
+    break;
   case SCT_AC3:
     codec_id = CODEC_ID_AC3;
     break;
@@ -73,6 +76,9 @@ streaming_component_type2codec_id(streaming_component_type_t type)
     break;
   case SCT_MPEG2AUDIO:
     codec_id = CODEC_ID_MP2;
+    break;
+  case SCT_VORBIS:
+    codec_id = CODEC_ID_VORBIS;
     break;
   case SCT_DVBSUB:
     codec_id = CODEC_ID_DVB_SUBTITLE;
@@ -89,6 +95,74 @@ streaming_component_type2codec_id(streaming_component_type_t type)
   }
 
   return codec_id;
+}
+
+
+/**
+ * Translate a libavcodec id to a component type
+ */
+streaming_component_type_t
+codec_id2streaming_component_type(enum CodecID id)
+{
+  streaming_component_type_t type = CODEC_ID_NONE;
+
+  switch(id) {
+  case CODEC_ID_H264:
+    type = SCT_H264;
+    break;
+  case CODEC_ID_MPEG2VIDEO:
+    type = SCT_MPEG2VIDEO;
+    break;
+  case CODEC_ID_VP8:
+    type = SCT_VP8;
+    break;
+  case CODEC_ID_AC3:
+    type = SCT_AC3;
+    break;
+  case CODEC_ID_EAC3:
+    type = SCT_EAC3;
+    break;
+  case CODEC_ID_AAC:
+    type = SCT_AAC;
+    break;
+  case CODEC_ID_MP2:
+    type = SCT_MPEG2AUDIO;
+    break;
+  case CODEC_ID_VORBIS:
+    type = SCT_VORBIS;
+    break;
+  case CODEC_ID_DVB_SUBTITLE:
+    type = SCT_DVBSUB;
+    break;
+  case CODEC_ID_TEXT:
+    type = SCT_TEXTSUB;
+    break;
+  case CODEC_ID_DVB_TELETEXT:
+    type = SCT_TELETEXT;
+    break;
+  case CODEC_ID_NONE:
+    type = SCT_NONE;
+    break;
+  default:
+    type = SCT_UNKNOWN;
+    break;
+  }
+
+  return type;
+}
+
+
+/**
+ * 
+ */ 
+int
+libav_is_encoder(AVCodec *codec)
+{
+#if LIBAVCODEC_VERSION_INT >= ((54<<16)+(7<<8)+0)
+  return av_codec_is_encoder(codec);
+#else
+  return codec->encode || codec->encode2;
+#endif
 }
 
 /**

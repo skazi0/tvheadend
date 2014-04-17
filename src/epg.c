@@ -100,8 +100,8 @@ void epg_updated ( void )
 
   /* Remove unref'd */
   while ((eo = LIST_FIRST(&epg_object_unref))) {
-    tvhlog(LOG_DEBUG, "epg",
-           "unref'd object %u (%s) created during update", eo->id, eo->uri);
+    tvhtrace("epg",
+             "unref'd object %u (%s) created during update", eo->id, eo->uri);
     LIST_REMOVE(eo, un_link);
     eo->destroy(eo);
   }
@@ -126,10 +126,8 @@ static void _epg_object_destroy
   ( epg_object_t *eo, epg_object_tree_t *tree )
 {
   assert(eo->refcount == 0);
-#ifdef EPG_TRACE
-  tvhlog(LOG_DEBUG, "epg", "eo [%p, %u, %d, %s] destroy",
-         eo, eo->id, eo->type, eo->uri);
-#endif
+  tvhtrace("epg", "eo [%p, %u, %d, %s] destroy",
+           eo, eo->id, eo->type, eo->uri);
   if (eo->uri) free(eo->uri);
   if (tree) RB_REMOVE(tree, eo, uri_link);
   if (eo->_updated) LIST_REMOVE(eo, up_link);
@@ -139,10 +137,8 @@ static void _epg_object_destroy
 static void _epg_object_getref ( void *o )
 {
   epg_object_t *eo = o;
-#ifdef EPG_TRACE
-  tvhlog(LOG_DEBUG, "epg", "eo [%p, %u, %d, %s] getref %d",
-         eo, eo->id, eo->type, eo->uri, eo->refcount+1);
-#endif
+  tvhtrace("epg", "eo [%p, %u, %d, %s] getref %d",
+           eo, eo->id, eo->type, eo->uri, eo->refcount+1);
   if (eo->refcount == 0) LIST_REMOVE(eo, un_link);
   eo->refcount++;
 }
@@ -150,10 +146,8 @@ static void _epg_object_getref ( void *o )
 static void _epg_object_putref ( void *o )
 {
   epg_object_t *eo = o;
-#ifdef EPG_TRACE
-  tvhlog(LOG_DEBUG, "epg", "eo [%p, %u, %d, %s] putref %d",
-         eo, eo->id, eo->type, eo->uri, eo->refcount-1);
-#endif
+  tvhtrace("epg", "eo [%p, %u, %d, %s] putref %d",
+           eo, eo->id, eo->type, eo->uri, eo->refcount-1);
   assert(eo->refcount>0);
   eo->refcount--;
   if (!eo->refcount) eo->destroy(eo);
@@ -163,10 +157,8 @@ static void _epg_object_set_updated ( void *o )
 {
   epg_object_t *eo = o;
   if (!eo->_updated) {
-#ifdef EPG_TRACE
-    tvhlog(LOG_DEBUG, "epg", "eo [%p, %u, %d, %s] updated",
-           eo, eo->id, eo->type, eo->uri);
-#endif
+    tvhtrace("epg", "eo [%p, %u, %d, %s] updated",
+             eo, eo->id, eo->type, eo->uri);
     eo->_updated = 1;
     eo->updated  = dispatch_clock;
     LIST_INSERT_HEAD(&epg_object_updated, eo, up_link);
@@ -180,10 +172,8 @@ static void _epg_object_create ( void *o )
   else if (eo->id > _epg_object_idx) _epg_object_idx = eo->id;
   if (!eo->getref) eo->getref = _epg_object_getref;
   if (!eo->putref) eo->putref = _epg_object_putref;
-#ifdef EPG_TRACE
-  tvhlog(LOG_DEBUG, "epg", "eo [%p, %u, %d, %s] created",
-         eo, eo->id, eo->type, eo->uri);
-#endif
+  tvhtrace("epg", "eo [%p, %u, %d, %s] created",
+           eo, eo->id, eo->type, eo->uri);
   _epg_object_set_updated(eo);
   LIST_INSERT_HEAD(&epg_object_unref, eo, un_link);
   LIST_INSERT_HEAD(&epg_objects[eo->id & EPG_HASH_MASK], eo, id_link);
@@ -231,10 +221,8 @@ epg_object_t *epg_object_find_by_id ( uint32_t id, epg_object_type_t type )
 static htsmsg_t * _epg_object_serialize ( void *o )
 {
   epg_object_t *eo = o;
-#ifdef EPG_TRACE
-  tvhlog(LOG_DEBUG, "epg", "eo [%p, %u, %d, %s] serialize",
-         eo, eo->id, eo->type, eo->uri);
-#endif
+  tvhtrace("epg", "eo [%p, %u, %d, %s] serialize",
+           eo, eo->id, eo->type, eo->uri);
   htsmsg_t *m;
   if ( !eo->id || !eo->type ) return NULL;
   m = htsmsg_create_map();
@@ -263,10 +251,8 @@ static epg_object_t *_epg_object_deserialize ( htsmsg_t *m, epg_object_t *eo )
     _epg_object_set_updated(eo);
     eo->updated = s64;
   }
-#ifdef EPG_TRACE
-  tvhlog(LOG_DEBUG, "epg", "eo [%p, %u, %d, %s] deserialize",
-         eo, eo->id, eo->type, eo->uri);
-#endif
+  tvhtrace("epg", "eo [%p, %u, %d, %s] deserialize",
+           eo, eo->id, eo->type, eo->uri);
   return eo;
 }
 
@@ -518,6 +504,8 @@ htsmsg_t *epg_brand_serialize ( epg_brand_t *brand )
     lang_str_serialize(brand->summary, m, "summary");
   if (brand->season_count)
     htsmsg_add_u32(m, "season-count", brand->season_count);
+  if (brand->image)
+    htsmsg_add_str(m, "image", brand->image);
   return m;
 }
 
@@ -526,6 +514,7 @@ epg_brand_t *epg_brand_deserialize ( htsmsg_t *m, int create, int *save )
   epg_object_t **skel = _epg_brand_skel();
   epg_brand_t *eb;
   uint32_t u32;
+  const char *str;
   lang_str_t *ls;
   lang_str_ele_t *e;
 
@@ -544,6 +533,9 @@ epg_brand_t *epg_brand_deserialize ( htsmsg_t *m, int create, int *save )
   }
   if ( !htsmsg_get_u32(m, "season-count", &u32) )
     *save |= epg_brand_set_season_count(eb, u32, NULL);
+
+  if ( (str = htsmsg_get_str(m, "image")) )
+    *save |= epg_brand_set_image(eb, str, NULL);
 
   return eb;
 }
@@ -700,6 +692,8 @@ htsmsg_t *epg_season_serialize ( epg_season_t *season )
     htsmsg_add_u32(m, "episode-count", season->episode_count);
   if (season->brand)
     htsmsg_add_str(m, "brand", season->brand->uri);
+  if (season->image)
+    htsmsg_add_str(m, "image", season->image);
   return m;
 }
 
@@ -730,6 +724,9 @@ epg_season_t *epg_season_deserialize ( htsmsg_t *m, int create, int *save )
   if ( (str = htsmsg_get_str(m, "brand")) )
     if ( (eb = epg_brand_find_by_uri(str, 0, NULL)) )
       *save |= epg_season_set_brand(es, eb, NULL);
+
+  if ( (str = htsmsg_get_str(m, "image")) )
+    *save |= epg_season_set_image(es, str, NULL);
 
   return es;
 }
@@ -767,16 +764,15 @@ static htsmsg_t *epg_episode_num_serialize ( epg_episode_num_t *num )
   return m;
 }
 
-static epg_episode_num_t *epg_episode_num_deserialize 
+static void epg_episode_num_deserialize 
   ( htsmsg_t *m, epg_episode_num_t *num )
 {
   const char *str;
   uint32_t u32;
-  if (!m) return NULL;
-  if (!num)
-    num = calloc(1, sizeof(epg_episode_num_t));
-  else
-    memset(num, 0, sizeof(epg_episode_num_t));
+  assert(m && num);
+
+  memset(num, 0, sizeof(epg_episode_num_t));
+
   if (!htsmsg_get_u32(m, "e_num", &u32))
     num->e_num = u32;
   if (!htsmsg_get_u32(m, "e_cnt", &u32))
@@ -791,7 +787,6 @@ static epg_episode_num_t *epg_episode_num_deserialize
     num->p_cnt = u32;
   if ((str = htsmsg_get_str(m, "text")))
     num->text = strdup(str);
-  return num;
 }
 
 static void _epg_episode_destroy ( void *eo )
@@ -1168,6 +1163,9 @@ htsmsg_t *epg_episode_serialize ( epg_episode_t *episode )
     htsmsg_add_u32(m, "age_rating", episode->age_rating);
   if (episode->first_aired)
     htsmsg_add_s64(m, "first_aired", episode->first_aired);
+  if (episode->image)
+    htsmsg_add_str(m, "image", episode->image);
+
   return m;
 }
 
@@ -1244,6 +1242,9 @@ epg_episode_t *epg_episode_deserialize ( htsmsg_t *m, int create, int *save )
 
   if (!htsmsg_get_s64(m, "first_aired", &s64))
     *save |= epg_episode_set_first_aired(ee, (time_t)s64, NULL);
+
+  if ( (str = htsmsg_get_str(m, "image")) )
+    *save |= epg_episode_set_image(ee, str, NULL);
 
   return ee;
 }
@@ -1391,8 +1392,9 @@ static void _epg_channel_timer_callback ( void *p )
 
     /* Expire */
     if ( ebc->stop <= dispatch_clock ) {
-      tvhlog(LOG_DEBUG, "epg", "expire event %u from %s",
-             ebc->id, ch->ch_name);
+      tvhlog(LOG_DEBUG, "epg", "expire event %u (%s) from %s",
+             ebc->id, epg_broadcast_get_title(ebc, NULL),
+             channel_get_name(ch));
       _epg_channel_rem_broadcast(ch, ebc, NULL);
       continue; // skip to next
 
@@ -1410,25 +1412,22 @@ static void _epg_channel_timer_callback ( void *p )
     break;
   }
   
-  /* Change */
-  if (cur != ch->ch_epg_now || nxt != ch->ch_epg_next)
+  /* Change (update HTSP) */
+  if (cur != ch->ch_epg_now || nxt != ch->ch_epg_next) {
     tvhlog(LOG_DEBUG, "epg", "now/next %u/%u set on %s",
            ch->ch_epg_now  ? ch->ch_epg_now->id : 0,
            ch->ch_epg_next ? ch->ch_epg_next->id : 0,
-           ch->ch_name);
+           channel_get_name(ch));
+    tvhlog(LOG_DEBUG, "epg", "inform HTSP of now event change on %s",
+           channel_get_name(ch));
+    htsp_channel_update_nownext(ch);
+  }
 
   /* re-arm */
   if ( next ) {
     tvhlog(LOG_DEBUG, "epg", "arm channel timer @ %"PRItime_t" for %s",
-           next, ch->ch_name);
+           next, channel_get_name(ch));
     gtimer_arm_abs(&ch->ch_epg_timer, _epg_channel_timer_callback, ch, next);
-  }
-
-  /* Update HTSP */
-  if ( cur != ch->ch_epg_now ) {
-    tvhlog(LOG_DEBUG, "epg", "inform HTSP of now event change on %s",
-           ch->ch_name);
-    htsp_channel_update_current(ch);
   }
 
   /* Remove refs */
@@ -1461,6 +1460,9 @@ static epg_broadcast_t *_epg_channel_add_broadcast
       _epg_object_create(ret);
       // Note: sets updated
       _epg_object_getref(ret);
+      tvhtrace("epg", "added event %u (%s) on %s @ %"PRItime_t " to %"PRItime_t,
+               ret->id, epg_broadcast_get_title(ret, NULL),
+               channel_get_name(ch), ret->start, ret->stop);
 
     /* Existing */
     } else {
@@ -1474,6 +1476,9 @@ static epg_broadcast_t *_epg_channel_add_broadcast
       } else {
         ret->stop = (*bcast)->stop;
         _epg_object_set_updated(ret);
+        tvhtrace("epg", "updated event %u (%s) on %s @ %"PRItime_t " to %"PRItime_t,
+                 ret->id, epg_broadcast_get_title(ret, NULL),
+                 channel_get_name(ch), ret->start, ret->stop);
       }
     }
   }
@@ -1484,12 +1489,18 @@ static epg_broadcast_t *_epg_channel_add_broadcast
   /* Remove overlapping (before) */
   while ( (ebc = RB_PREV(ret, sched_link)) != NULL ) {
     if ( ebc->stop <= ret->start ) break;
+    tvhtrace("epg", "remove overlap (b) event %u (%s) on %s @ %"PRItime_t " to %"PRItime_t,
+             ebc->id, epg_broadcast_get_title(ebc, NULL),
+             channel_get_name(ch), ebc->start, ebc->stop);
     _epg_channel_rem_broadcast(ch, ebc, ret);
   }
 
   /* Remove overlapping (after) */
   while ( (ebc = RB_NEXT(ret, sched_link)) != NULL ) {
     if ( ebc->start >= ret->stop ) break;
+    tvhtrace("epg", "remove overlap (a) event %u (%s) on %s @ %"PRItime_t " to %"PRItime_t,
+             ebc->id, epg_broadcast_get_title(ebc, NULL),
+             channel_get_name(ch), ebc->start, ebc->stop);
     _epg_channel_rem_broadcast(ch, ebc, ret);
   }
 
@@ -1727,8 +1738,8 @@ epg_episode_t *epg_broadcast_get_episode
   if (!ebc) return NULL;
   if (ebc->episode) return ebc->episode;
   if (!create) return NULL;
-  snprintf(uri, sizeof(uri)-1, "tvh://channel-%d/bcast-%u/episode",
-           ebc->channel->ch_id, ebc->id);
+  snprintf(uri, sizeof(uri)-1, "tvh://channel-%s/bcast-%u/episode",
+           idnode_uuid_as_str(&ebc->channel->ch_id), ebc->id);
   if ((ee = epg_episode_find_by_uri(uri, 1, save)))
     *save |= epg_broadcast_set_episode(ebc, ee, ebc->grabber);
   return ee;
@@ -1762,7 +1773,7 @@ htsmsg_t *epg_broadcast_serialize ( epg_broadcast_t *broadcast )
   htsmsg_add_s64(m, "stop", broadcast->stop);
   htsmsg_add_str(m, "episode", broadcast->episode->uri);
   if (broadcast->channel)
-    htsmsg_add_u32(m, "channel", broadcast->channel->ch_id);
+    htsmsg_add_str(m, "channel", channel_get_uuid(broadcast->channel));
   if (broadcast->dvb_eid)
     htsmsg_add_u32(m, "dvb_eid", broadcast->dvb_eid);
   if (broadcast->is_widescreen)
@@ -1802,7 +1813,7 @@ epg_broadcast_t *epg_broadcast_deserialize
   epg_serieslink_t *esl;
   lang_str_t *ls;
   const char *str;
-  uint32_t chid, eid, u32;
+  uint32_t eid, u32;
   int64_t start, stop;
 
   if ( htsmsg_get_s64(m, "start", &start) ) return NULL;
@@ -1824,9 +1835,8 @@ epg_broadcast_t *epg_broadcast_deserialize
   }
 
   /* Get channel */
-  if ( !htsmsg_get_u32(m, "channel", &chid) ) {
-    ch  = channel_find_by_identifier(chid);
-  }
+  if ((str = htsmsg_get_str(m, "channel")))
+    ch = channel_find(str);
   if (!ch) return NULL;
 
   /* Create */
@@ -1885,153 +1895,153 @@ epg_broadcast_t *epg_broadcast_deserialize
 static const char *_epg_genre_names[16][16] = {
   { "" },
   {
-    "Movie/Drama",
-    "detective/thriller",
-    "adventure/western/war",
-    "science fiction/fantasy/horror",
-    "comedy",
-    "soap/melodrama/folkloric",
-    "romance",
-    "serious/classical/religious/historical movie/drama",
-    "adult movie/drama",
-    "adult movie/drama",
-    "adult movie/drama",
-    "adult movie/drama",
-    "adult movie/drama",
-    "adult movie/drama",
+    "Movie / Drama",
+    "Detective / Thriller",
+    "Adventure / Western / War",
+    "Science fiction / Fantasy / Horror",
+    "Comedy",
+    "Soap / Melodrama / Folkloric",
+    "Romance",
+    "Serious / Classical / Religious / Historical movie / Drama",
+    "Adult movie / Drama",
+    "Adult movie / Drama",
+    "Adult movie / Drama",
+    "Adult movie / Drama",
+    "Adult movie / Drama",
+    "Adult movie / Drama",
   },
   {
-    "News/Current affairs",
-    "news/weather report",
-    "news magazine",
-    "documentary",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
-    "discussion/interview/debate",
+    "News / Current affairs",
+    "News / Weather report",
+    "News magazine",
+    "Documentary",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
+    "Discussion / Interview / Debate",
   },
   {
-    "Show/Game show",
-    "game show/quiz/contest",
-    "variety show",
-    "talk show",
-    "talk show",
-    "talk show",
-    "talk show",
-    "talk show",
-    "talk show",
-    "talk show",
-    "talk show",
-    "talk show",
-    "talk show",
-    "talk show",
+    "Show / Game show",
+    "Game show / Quiz / Contest",
+    "Variety show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
+    "Talk show",
   },
   {
     "Sports",
-    "special events (Olympic Games, World Cup, etc.)",
-    "sports magazines",
-    "football/soccer",
-    "tennis/squash",
-    "team sports (excluding football)",
-    "athletics",
-    "motor sport",
-    "water sport",
+    "Special events (Olympic Games, World Cup, etc.)",
+    "Sports magazines",
+    "Football / Soccer",
+    "Tennis / Squash",
+    "Team sports (excluding football)",
+    "Athletics",
+    "Motor sport",
+    "Water sport",
   },
   {
-    "Children's/Youth programmes",
-    "pre-school children's programmes",
-    "entertainment programmes for 6 to14",
-    "entertainment programmes for 10 to 16",
-    "informational/educational/school programmes",
-    "cartoons/puppets",
-    "cartoons/puppets",
-    "cartoons/puppets",
-    "cartoons/puppets",
-    "cartoons/puppets",
-    "cartoons/puppets",
-    "cartoons/puppets",
-    "cartoons/puppets",
-    "cartoons/puppets",
+    "Children's / Youth programmes",
+    "Pre-school children's programmes",
+    "Entertainment programmes for 6 to 14",
+    "Entertainment programmes for 10 to 16",
+    "Informational / Educational / School programmes",
+    "Cartoons / Puppets",
+    "Cartoons / Puppets",
+    "Cartoons / Puppets",
+    "Cartoons / Puppets",
+    "Cartoons / Puppets",
+    "Cartoons / Puppets",
+    "Cartoons / Puppets",
+    "Cartoons / Puppets",
+    "Cartoons / Puppets",
   },
   {
-    "Music/Ballet/Dance",
-    "rock/pop",
-    "serious music/classical music",
-    "folk/traditional music",
-    "jazz",
-    "musical/opera",
-    "musical/opera",
-    "musical/opera",
-    "musical/opera",
-    "musical/opera",
-    "musical/opera",
-    "musical/opera",
-    "musical/opera",
+    "Music / Ballet / Dance",
+    "Rock / Pop",
+    "Serious music / Classical music",
+    "Folk / Traditional music",
+    "Jazz",
+    "Musical / Opera",
+    "Musical / Opera",
+    "Musical / Opera",
+    "Musical / Opera",
+    "Musical / Opera",
+    "Musical / Opera",
+    "Musical / Opera",
+    "Musical / Opera",
   },
   {
-    "Arts/Culture (without music)",
-    "performing arts",
-    "fine arts",
-    "religion",
-    "popular culture/traditional arts",
-    "literature",
-    "film/cinema",
-    "experimental film/video",
-    "broadcasting/press",
+    "Arts / Culture (without music)",
+    "Performing arts",
+    "Fine arts",
+    "Religion",
+    "Popular culture / Traditional arts",
+    "Literature",
+    "Film / Cinema",
+    "Experimental film / Video",
+    "Broadcasting / Press",
   },
   {
-    "Social/Political issues/Economics",
-    "magazines/reports/documentary",
-    "economics/social advisory",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
-    "remarkable people",
+    "Social / Political issues / Economics",
+    "Magazines / Reports / Documentary",
+    "Economics / Social advisory",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
+    "Remarkable people",
   },
   {
-    "Education/Science/Factual topics",
-    "nature/animals/environment",
-    "technology/natural sciences",
-    "medicine/physiology/psychology",
-    "foreign countries/expeditions",
-    "social/spiritual sciences",
-    "further education",
-    "languages",
-    "languages",
-    "languages",
-    "languages",
-    "languages",
-    "languages",
-    "languages",
+    "Education / Science / Factual topics",
+    "Nature / Animals / Environment",
+    "Technology / Natural sciences",
+    "Medicine / Physiology / Psychology",
+    "Foreign countries / Expeditions",
+    "Social / Spiritual sciences",
+    "Further education",
+    "Languages",
+    "Languages",
+    "Languages",
+    "Languages",
+    "Languages",
+    "Languages",
+    "Languages",
   },
   {
     "Leisure hobbies",
-    "tourism/travel",
-    "handicraft",
-    "motoring",
-    "fitness and health",
-    "cooking",
-    "advertisement/shopping",
-    "gardening",
-    "gardening",
-    "gardening",
-    "gardening",
-    "gardening",
-    "gardening",
-    "gardening",
+    "Tourism / Travel",
+    "Handicraft",
+    "Motoring",
+    "Fitness and health",
+    "Cooking",
+    "Advertisement / Shopping",
+    "Gardening",
+    "Gardening",
+    "Gardening",
+    "Gardening",
+    "Gardening",
+    "Gardening",
+    "Gardening",
   }
 };
 
@@ -2260,9 +2270,8 @@ void epg_query0
 
   /* All channels */
   } else {
-    RB_FOREACH(channel, &channel_name_tree, ch_name_link) {
+    CHANNEL_FOREACH(channel)
       _eqr_add_channel(eqr, channel, genre, preg, now, lang);
-    }
   }
   if (preg) regfree(preg);
 
@@ -2272,8 +2281,8 @@ void epg_query0
 void epg_query(epg_query_result_t *eqr, const char *channel, const char *tag,
 	       epg_genre_t *genre, const char *title, const char *lang)
 {
-  channel_t     *ch = channel ? channel_find_by_name(channel, 0, 0) : NULL;
-  channel_tag_t *ct = tag     ? channel_tag_find_by_name(tag, 0)    : NULL;
+  channel_t     *ch = channel ? channel_find(channel)    : NULL;
+  channel_tag_t *ct = tag     ? channel_tag_find_by_name(tag, 0) : NULL;
   epg_query0(eqr, ch, ct, genre, title, lang);
 }
 
@@ -2304,4 +2313,19 @@ char *epg_hash ( const char *t, const char *s, const char *d )
   if ( s && strlen(s) > 10 ) return md5sum(s);
   if ( t ) return md5sum(t);
   return NULL;
+}
+
+void epg_skel_done(void)
+{
+  epg_object_t **skel;
+  epg_broadcast_t **broad;
+
+  skel = _epg_brand_skel();
+  free(*skel); *skel = NULL;
+  skel = _epg_season_skel();
+  free(*skel); *skel = NULL;
+  skel = _epg_episode_skel();
+  free(*skel); *skel = NULL;
+  broad = _epg_broadcast_skel();
+  free(*broad); *broad = NULL;
 }

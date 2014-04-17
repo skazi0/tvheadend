@@ -33,7 +33,7 @@
 #include "tvheadend.h"
 #include "filebundle.h"
 
-static char *settingspath;
+static char *settingspath = NULL;
 
 /**
  *
@@ -41,7 +41,7 @@ static char *settingspath;
 const char *
 hts_settings_get_root(void)
 {
-  return settingspath ?: "No settings dir";
+  return settingspath;
 }
 
 /**
@@ -50,31 +50,17 @@ hts_settings_get_root(void)
 void
 hts_settings_init(const char *confpath)
 {
-  char buf[256];
-  const char *homedir = getenv("HOME");
-  struct stat st;
+  if (confpath)
+    settingspath = realpath(confpath, NULL);
+}
 
-  if(confpath != NULL) {
-    settingspath = strdup(confpath);
-  } else if(homedir != NULL) {
-    snprintf(buf, sizeof(buf), "%s/.hts", homedir);
-    if(stat(buf, &st) == 0 || mkdir(buf, 0700) == 0) {
-	    snprintf(buf, sizeof(buf), "%s/.hts/tvheadend", homedir);
-	    if(stat(buf, &st) == 0 || mkdir(buf, 0700) == 0)
-	      settingspath = strdup(buf);
-    }
-  }
-  if(settingspath == NULL) {
-    tvhlog(LOG_ALERT, "START", 
-	   "No configuration path set, "
-	   "settings and configuration will not be saved");
-  } else if(access(settingspath, R_OK | W_OK)) {
-    tvhlog(LOG_ALERT, "START", 
-	   "Configuration path %s is not read/write:able "
-	   "by user (UID:%d, GID:%d) -- %s",
-	   settingspath, getuid(), getgid(), strerror(errno));
-    settingspath = NULL;
-  }
+/**
+ *
+ */
+void
+hts_settings_done(void)
+{
+  free(settingspath);
 }
 
 /**
@@ -157,6 +143,8 @@ hts_settings_save(htsmsg_t *record, const char *pathfmt, ...)
   /* Create directories */
   if (hts_settings_makedirs(path)) return;
 
+  tvhdebug("settings", "saving to %s", path);
+
   /* Create tmp file */
   snprintf(tmppath, sizeof(tmppath), "%s.tmp", path);
   if((fd = tvh_open(tmppath, O_CREAT | O_TRUNC | O_RDWR, 0700)) < 0) {
@@ -222,7 +210,7 @@ hts_settings_load_one(const char *filename)
  *
  */
 static htsmsg_t *
-_hts_settings_load(const char *fullpath)
+hts_settings_load_path(const char *fullpath, int depth)
 {
   char child[256];
   struct filebundle_stat st;
@@ -245,9 +233,16 @@ _hts_settings_load(const char *fullpath)
     for(i = 0; i < n; i++) {
       d = namelist[i];
       if(d->name[0] != '.') {
-	      snprintf(child, sizeof(child), "%s/%s", fullpath, d->name);
- 	      if ((c = hts_settings_load_one(child)))
+
+        snprintf(child, sizeof(child), "%s/%s", fullpath, d->name);
+        if(d->type == FB_DIR && depth > 0) {
+          c = hts_settings_load_path(child, depth - 1);
+        } else {
+          c = hts_settings_load_one(child);
+        }
+        if(c != NULL)
           htsmsg_add_msg(r, d->name, c);
+
       }
       free(d);
     }
@@ -264,30 +259,55 @@ _hts_settings_load(const char *fullpath)
 /**
  *
  */
-htsmsg_t *
-hts_settings_load(const char *pathfmt, ...)
+static htsmsg_t *
+hts_settings_vload(const char *pathfmt, va_list ap, int depth)
 {
   htsmsg_t *ret = NULL;
   char fullpath[256];
-  va_list ap;
+  va_list ap2;
+  va_copy(ap2, ap);
 
   /* Try normal path */
-  va_start(ap, pathfmt);
   _hts_settings_buildpath(fullpath, sizeof(fullpath), 
                           pathfmt, ap, settingspath);
-  va_end(ap);
-  ret = _hts_settings_load(fullpath);
+  ret = hts_settings_load_path(fullpath, depth);
 
   /* Try bundle path */
   if (!ret && *pathfmt != '/') {
-    va_start(ap, pathfmt);
     _hts_settings_buildpath(fullpath, sizeof(fullpath),
-                            pathfmt, ap, "data/conf");
-    va_end(ap);
-    ret = _hts_settings_load(fullpath);
+                            pathfmt, ap2, "data/conf");
+    ret = hts_settings_load_path(fullpath, depth);
   }
-  
+
   return ret;
+}
+
+
+/**
+ *
+ */
+htsmsg_t *
+hts_settings_load(const char *pathfmt, ...)
+{
+  va_list ap;
+  va_start(ap, pathfmt);
+  htsmsg_t *r = hts_settings_vload(pathfmt, ap, 0);
+  va_end(ap);
+  return r;
+}
+
+
+/**
+ *
+ */
+htsmsg_t *
+hts_settings_load_r(int depth, const char *pathfmt, ...)
+{
+  va_list ap;
+  va_start(ap, pathfmt);
+  htsmsg_t *r = hts_settings_vload(pathfmt, ap, depth);
+  va_end(ap);
+  return r;
 }
 
 /**
@@ -306,7 +326,7 @@ hts_settings_remove(const char *pathfmt, ...)
   va_end(ap);
   if (stat(fullpath, &st) == 0) {
     if (S_ISDIR(st.st_mode))
-      rmdir(fullpath);
+      rmtree(fullpath);
     else
       unlink(fullpath);
   }
@@ -334,4 +354,22 @@ hts_settings_open_file(int for_write, const char *pathfmt, ...)
   int flags = for_write ? O_CREAT | O_TRUNC | O_WRONLY : O_RDONLY;
 
   return tvh_open(path, flags, 0700);
+}
+
+/*
+ * Check if a path exists
+ */
+int
+hts_settings_exists ( const char *pathfmt, ... )
+{
+  va_list ap;
+  char path[256];
+  struct stat st;
+
+  /* Build path */
+  va_start(ap, pathfmt);
+  _hts_settings_buildpath(path, sizeof(path), pathfmt, ap, settingspath);
+  va_end(ap);
+
+  return (stat(path, &st) == 0);
 }

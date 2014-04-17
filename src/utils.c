@@ -77,7 +77,7 @@ static uint32_t crc_tab[256] = {
 };
 
 uint32_t
-tvh_crc32(uint8_t *data, size_t datalen, uint32_t crc)
+tvh_crc32(const uint8_t *data, size_t datalen, uint32_t crc)
 {
   while(datalen--)
     crc = (crc << 8) ^ crc_tab[((crc >> 24) ^ *data++) & 0xff];
@@ -247,6 +247,12 @@ put_utf8(char *out, int c)
   return 6;
 }
 
+static void
+sbuf_alloc_fail(int len)
+{
+  fprintf(stderr, "Unable to allocate %d bytes\n", len);
+  abort();
+}
 
 void
 sbuf_init(sbuf_t *sb)
@@ -254,41 +260,71 @@ sbuf_init(sbuf_t *sb)
   memset(sb, 0, sizeof(sbuf_t));
 }
 
+void
+sbuf_init_fixed(sbuf_t *sb, int len)
+{
+  memset(sb, 0, sizeof(sbuf_t));
+  sb->sb_data = malloc(len);
+  if (sb->sb_data == NULL)
+    sbuf_alloc_fail(len);
+  sb->sb_size = len;
+}
 
 void
 sbuf_free(sbuf_t *sb)
 {
-  if(sb->sb_data)
-    free(sb->sb_data);
+  free(sb->sb_data);
   sb->sb_size = sb->sb_ptr = sb->sb_err = 0;
   sb->sb_data = NULL;
 }
 
 void
-sbuf_reset(sbuf_t *sb)
+sbuf_reset(sbuf_t *sb, int max_len)
 {
-  sb->sb_ptr = 0;
-  sb->sb_err = 0;
+  sb->sb_ptr = sb->sb_err = 0;
+  if (sb->sb_size > max_len) {
+    void *n = realloc(sb->sb_data, max_len);
+    if (n) {
+      sb->sb_data = n;
+      sb->sb_size = max_len;
+    }
+  }
 }
 
 void
-sbuf_err(sbuf_t *sb)
+sbuf_reset_and_alloc(sbuf_t *sb, int len)
 {
-  sb->sb_err = 1;
+  if (sb->sb_data) {
+    if (len != sb->sb_size) {
+      void *n = realloc(sb->sb_data, len);
+      if (n) {
+        sb->sb_data = n;
+        sb->sb_size = len;
+      }
+    }
+  } else {
+    sb->sb_data = malloc(len);
+    sb->sb_size = len;
+  }
+  if (sb->sb_data == NULL)
+    sbuf_alloc_fail(len);
+  sb->sb_ptr = sb->sb_err = 0;
 }
 
 void
-sbuf_alloc(sbuf_t *sb, int len)
+sbuf_alloc_(sbuf_t *sb, int len)
 {
   if(sb->sb_data == NULL) {
-    sb->sb_size = 4000;
+    sb->sb_size = len * 4 > 4000 ? len * 4 : 4000;
     sb->sb_data = malloc(sb->sb_size);
-  }
-
-  if(sb->sb_ptr + len >= sb->sb_size) {
+    return;
+  } else {
     sb->sb_size += len * 4;
     sb->sb_data = realloc(sb->sb_data, sb->sb_size);
   }
+
+  if(sb->sb_data == NULL)
+    sbuf_alloc_fail(sb->sb_size);
 }
 
 void
@@ -326,6 +362,15 @@ sbuf_cut(sbuf_t *sb, int off)
   assert(off <= sb->sb_ptr);
   sb->sb_ptr = sb->sb_ptr - off;
   memmove(sb->sb_data, sb->sb_data + off, sb->sb_ptr);
+}
+
+ssize_t
+sbuf_read(sbuf_t *sb, int fd)
+{
+  ssize_t n = read(fd, sb->sb_data + sb->sb_ptr, sb->sb_size - sb->sb_ptr);
+  if (n > 0)
+    sb->sb_ptr += n;
+  return n;
 }
 
 char *

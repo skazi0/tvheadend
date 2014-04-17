@@ -33,6 +33,7 @@
 #include "plumbing/tsfix.h"
 #include "plumbing/globalheaders.h"
 #include "htsp_server.h"
+#include "atomic.h"
 
 #include "muxer.h"
 
@@ -90,7 +91,7 @@ dvr_rec_subscribe(dvr_entry_t *de)
 					      buf, st, flags,
 					      NULL, NULL, NULL);
 
-  pthread_create(&de->de_thread, NULL, dvr_thread, de);
+  tvhthread_create(&de->de_thread, NULL, dvr_thread, de, 0);
 }
 
 /**
@@ -126,10 +127,17 @@ cleanupfilename(char *s, int dvr_flags)
 {
   int i, len = strlen(s);
   for(i = 0; i < len; i++) { 
-    if((dvr_flags & DVR_WHITESPACE_IN_TITLE) && (s[i] == ' ' || s[i] == '\t'))
+
+    if(s[i] == '/')
+      s[i] = '-';
+
+    else if((dvr_flags & DVR_WHITESPACE_IN_TITLE) &&
+            (s[i] == ' ' || s[i] == '\t'))
       s[i] = '-';	
 
-    if((s[i] < 32) || (s[i] > 122) || (strchr("/:\\<>|*?'\"", s[i]) != NULL))
+    else if((dvr_flags & DVR_CLEAN_TITLE) &&
+            ((s[i] < 32) || (s[i] > 122) ||
+             (strchr("/:\\<>|*?'\"", s[i]) != NULL)))
       s[i] = '-';
   }
 }
@@ -198,7 +206,7 @@ pvr_generate_filename(dvr_entry_t *de, const streaming_start_t *ss)
 
 
   /* */
-  if(makedirs(path, 0777) != 0) {
+  if(makedirs(path, 0755) != 0) {
     return -1;
   }
   
@@ -280,8 +288,11 @@ dvr_rec_start(dvr_entry_t *de, const streaming_start_t *ss)
   const streaming_start_component_t *ssc;
   int i;
   dvr_config_t *cfg = dvr_config_find_by_name_default(de->de_config_name);
+  muxer_container_type_t mc;
 
-  de->de_mux = muxer_create(de->de_mc);
+  mc = de->de_mc;
+
+  de->de_mux = muxer_create(mc, &cfg->dvr_muxcnf);
   if(!de->de_mux) {
     dvr_rec_fatal_error(de, "Unable to create muxer");
     return -1;
@@ -415,7 +426,17 @@ dvr_thread(void *aux)
       pthread_cond_wait(&sq->sq_cond, &sq->sq_mutex);
       continue;
     }
-    
+
+    if (de->de_s && started) {
+      pktbuf_t *pb = NULL;
+      if (sm->sm_type == SMT_PACKET)
+        pb = ((th_pkt_t*)sm->sm_data)->pkt_payload;
+      else if (sm->sm_type == SMT_MPEGTS)
+        pb = sm->sm_data;
+      if (pb)
+        atomic_add(&de->de_s->ths_bytes_out, pktbuf_len(pb));
+    }
+
     TAILQ_REMOVE(&sq->sq_queue, sm, sm_link);
 
     pthread_mutex_unlock(&sq->sq_mutex);
@@ -586,8 +607,8 @@ dvr_spawn_postproc(dvr_entry_t *de, const char *dvr_postproc)
   }
 
   fbasename = strdup(de->de_filename); 
-  snprintf(start, sizeof(start), "%ld", de->de_start - de->de_start_extra);
-  snprintf(stop, sizeof(stop),   "%ld", de->de_stop  + de->de_stop_extra);
+  snprintf(start, sizeof(start), "%"PRItime_t, de->de_start - de->de_start_extra);
+  snprintf(stop, sizeof(stop),   "%"PRItime_t, de->de_stop  + de->de_stop_extra);
 
   memset(fmap, 0, sizeof(fmap));
   fmap['f'] = de->de_filename; /* full path to recoding */

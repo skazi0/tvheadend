@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
 
 #include <openssl/sha.h>
 #include <openssl/rand.h>
@@ -42,6 +43,8 @@ struct access_ticket_queue access_tickets;
 
 const char *superuser_username;
 const char *superuser_password;
+
+static int access_noacl;
 
 /**
  *
@@ -229,6 +232,9 @@ access_verify(const char *username, const char *password,
   uint32_t bits = 0;
   access_entry_t *ae;
 
+  if (access_noacl)
+    return 0;
+
   if(username != NULL && superuser_username != NULL && 
      password != NULL && superuser_password != NULL && 
      !strcmp(username, superuser_username) &&
@@ -273,6 +279,9 @@ access_get_hashed(const char *username, const uint8_t digest[20],
   uint8_t d[20];
   uint32_t r = 0;
   int match = 0;
+
+  if(access_noacl)
+    return 0xffffffff;
 
   if(superuser_username != NULL && superuser_password != NULL) {
 
@@ -338,7 +347,22 @@ access_get_by_addr(struct sockaddr *src)
   return r;
 }
 
+/**
+ *
+ */
+uint32_t
+access_tag_only(const char *username)
+{
+  access_entry_t *ae;
+  uint32_t r = 0;
 
+  TAILQ_FOREACH(ae, &access_entries, ae_link) {
+
+    if(!strcmp(ae->ae_username, username))
+      return ae->ae_tagonly;
+  }
+  return r;
+}
 
 
 /**
@@ -511,6 +535,7 @@ access_entry_destroy(access_entry_t *ae)
   free(ae->ae_id);
   free(ae->ae_username);
   free(ae->ae_password);
+  free(ae->ae_comment);
   TAILQ_REMOVE(&access_entries, ae, ae_link);
   free(ae);
 }
@@ -558,6 +583,7 @@ access_record_build(access_entry_t *ae)
   htsmsg_add_u32(e, "dvrallcfg", ae->ae_rights & ACCESS_RECORDER_ALL  ? 1 : 0);
   htsmsg_add_u32(e, "webui"    , ae->ae_rights & ACCESS_WEB_INTERFACE ? 1 : 0);
   htsmsg_add_u32(e, "admin"    , ae->ae_rights & ACCESS_ADMIN         ? 1 : 0);
+  htsmsg_add_u32(e, "tag_only" , ae->ae_tagonly);
 
 
   htsmsg_add_str(e, "id", ae->ae_id);
@@ -659,6 +685,9 @@ access_record_update(void *opaque, const char *id, htsmsg_t *values,
   if(!htsmsg_get_u32(values, "webui", &u32))
     access_update_flag(ae, ACCESS_WEB_INTERFACE, u32);
 
+  if(!htsmsg_get_u32(values, "tag_only", &u32))
+    ae->ae_tagonly = u32;
+
   return access_record_build(ae);
 }
 
@@ -696,7 +725,7 @@ static const dtable_class_t access_dtc = {
  *
  */
 void
-access_init(int createdefault)
+access_init(int createdefault, int noacl)
 {
   dtable_t *dt;
   htsmsg_t *r, *m;
@@ -708,6 +737,10 @@ access_init(int createdefault)
     pid_t pid;
     struct timeval tv;
   } randseed;
+
+  access_noacl = noacl;
+  if (noacl)
+    tvhlog(LOG_WARNING, "access", "Access control checking disabled");
 
   randseed.pid = getpid();
   gettimeofday(&randseed.tv, NULL);
@@ -726,6 +759,7 @@ access_init(int createdefault)
     ae->ae_comment = strdup("Default access entry");
 
     ae->ae_enabled = 1;
+    ae->ae_tagonly = 0;
     ae->ae_rights = 0xffffffff;
 
     TAILQ_INIT(&ae->ae_ipmasks);
@@ -742,7 +776,7 @@ access_init(int createdefault)
     dtable_record_store(dt, ae->ae_id, r);
     htsmsg_destroy(r);
 
-    tvhlog(LOG_WARNING, "accesscontrol",
+    tvhlog(LOG_WARNING, "access",
 	   "Created default wide open access controle entry");
   }
 
@@ -755,4 +789,14 @@ access_init(int createdefault)
     superuser_password =s ? strdup(s) : NULL;
     htsmsg_destroy(m);
   }
+}
+
+void
+access_done(void)
+{
+  access_entry_t *ae;
+
+  dtable_delete("accesscontrol");
+  while ((ae = TAILQ_FIRST(&access_entries)) != NULL)
+    access_entry_destroy(ae);
 }

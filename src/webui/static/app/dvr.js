@@ -27,6 +27,18 @@ tvheadend.containers = new Ext.data.JsonStore({
 	}
 });
 
+//For the cache configuration
+tvheadend.caches = new Ext.data.JsonStore({
+	autoLoad : true,
+	root : 'entries',
+	fields : [ 'index', 'description' ],
+	id : 'name',
+	url : 'dvr_caches',
+	baseParams : {
+		op : 'list'
+	}
+});
+
 
 /**
  * Configuration names
@@ -67,9 +79,8 @@ tvheadend.dvrDetails = function(entry) {
 	if (entry.url != null && entry.filesize > 0) {
 		content += '<div class="x-epg-meta">' + '<a href="' + entry.url
 			+ '" target="_blank">Download</a> '
-			+ parseInt(entry.filesize / 1000000) + ' MB<br>'
-			+ "<a href=\"javascript:tvheadend.VLC('dvrfile/" + entry.id
-			+ "')\">Play</a>" + '</div>';
+			+ parseInt(entry.filesize / 1000000) + ' MB</div>';
+
 	}
 
 	var win = new Ext.Window({
@@ -300,8 +311,8 @@ tvheadend.dvrschedule = function(title, iconCls, dvrStore) {
 				hiddenName : 'channelid',
 				editable : false,
 				allowBlank : false,
-				displayField : 'name',
-				valueField : 'chid',
+				displayField : 'val',
+				valueField : 'key',
 				mode : 'remote',
 				triggerAction : 'all',
 				store : tvheadend.channels
@@ -427,17 +438,18 @@ tvheadend.dvrschedule = function(title, iconCls, dvrStore) {
 tvheadend.autoreceditor = function() {
 	var fm = Ext.form;
 
-	var enabledColumn = new Ext.grid.CheckColumn({
-		header : "Enabled",
-		dataIndex : 'enabled',
-		width : 30
-	});
 
 	var cm = new Ext.grid.ColumnModel({
   defaultSortable: true,
   columns :
-		[
-			enabledColumn,
+	  [
+            {
+              header: 'Enabled',
+              dataIndex: 'enabled',
+              width: 30,
+              xtype: 'checkcolumn'
+            },
+
 			{
 				header : "Title (Regexp)",
 				dataIndex : 'title',
@@ -450,13 +462,20 @@ tvheadend.autoreceditor = function() {
 				dataIndex : 'channel',
 				editor : new Ext.form.ComboBox({
 					loadingText : 'Loading...',
-					displayField : 'name',
+					displayField : 'val',
+                                        valueField: 'key',
 					store : tvheadend.channels,
 					mode : 'local',
 					editable : false,
 					triggerAction : 'all',
 					emptyText : 'Only include channel...'
-				})
+				}),
+                                renderer : function (v, m, r) {
+                                  var i = tvheadend.channels.find('key', v);
+                                  if (i != -1)
+                                    v = tvheadend.channels.getAt(i).get('val')
+                                  return v
+                                }
 			},
       {
         header    : "SeriesLink",
@@ -497,12 +516,11 @@ tvheadend.autoreceditor = function() {
 				header : "Weekdays",
 				dataIndex : 'weekdays',
 				renderer : function(value, metadata, record, row, col, store) {
-					if (typeof value === 'undefined' || value.length < 1) return 'No days';
-
-					if (value == '1,2,3,4,5,6,7') return 'All days';
-
+                                        if (value.split) value = value.split(',')
+                                        if (value.length == 7) return 'All days';
+                                        if (value.length == 0 || value[0] == "") return 'No days';
 					ret = [];
-					tags = value.split(',');
+					tags = value;
 					for ( var i = 0; i < tags.length; i++) {
 						var tag = tvheadend.weekdays.getById(tags[i]);
 						if (typeof tag !== 'undefined') ret.push(tag.data.name);
@@ -585,7 +603,7 @@ tvheadend.autoreceditor = function() {
 			} ]});
 
 	return new tvheadend.tableEditor('Automatic Recorder', 'autorec', cm,
-		tvheadend.autorecRecord, [ enabledColumn ], tvheadend.autorecStore,
+		tvheadend.autorecRecord, [], tvheadend.autorecStore,
 		'autorec.html', 'wand');
 }
 /**
@@ -727,9 +745,9 @@ tvheadend.dvrsettings = function() {
 	var confreader = new Ext.data.JsonReader({
 		root : 'dvrSettings'
 	}, [ 'storage', 'postproc', 'retention', 'dayDirs', 'channelDirs',
-		'channelInTitle', 'container', 'dateInTitle', 'timeInTitle',
+		'channelInTitle', 'container', 'cache', 'dateInTitle', 'timeInTitle',
 		'preExtraTime', 'postExtraTime', 'whitespaceInTitle', 'titleDirs',
-		'episodeInTitle', 'cleanTitle', 'tagFiles', 'commSkip' ]);
+		'episodeInTitle', 'cleanTitle', 'tagFiles', 'commSkip', 'subtitleInTitle', 'episodeBeforeDate', 'rewritePAT', 'rewritePMT' ]);
 
 	var confcombo = new Ext.form.ComboBox({
 		store : tvheadend.configNames,
@@ -775,6 +793,21 @@ tvheadend.dvrsettings = function() {
 			editable : false,
 			width : 200,
 			hiddenName : 'container'
+		}), new Ext.form.ComboBox({
+			store : tvheadend.caches,
+			fieldLabel : 'Cache scheme',
+			triggerAction : 'all',
+			displayField : 'description',
+			valueField : 'index',
+			editable : false,
+			width : 200,
+			hiddenName : 'cache'
+		}), new Ext.form.Checkbox({
+			fieldLabel : 'Rewrite PAT in passthrough mode',
+			name : 'rewritePAT'
+		}), new Ext.form.Checkbox({
+			fieldLabel : 'Rewrite PMT in passthrough mode',
+			name : 'rewritePMT'
 		}), new Ext.form.NumberField({
 			allowNegative : false,
 			allowDecimals : false,
@@ -822,6 +855,12 @@ tvheadend.dvrsettings = function() {
 		}), new Ext.form.Checkbox({
 			fieldLabel : 'Skip commercials',
 			name : 'commSkip'
+		}), new Ext.form.Checkbox({
+			fieldLabel : 'Include subtitle in filename',
+			name : 'subtitleInTitle'
+		}), new Ext.form.Checkbox({
+			fieldLabel : 'Put episode in filename before date and time',
+			name : 'episodeBeforeDate'
 		}), {
 			width : 300,
 			fieldLabel : 'Post-processor command',

@@ -1,17 +1,17 @@
 Source: tvheadend
 Section: video
 Priority: extra
-Maintainer: Andreas Öman <andreas@lonelycoder.com>
-Build-Depends: debhelper (>= 7.0.50), pkg-config, libavahi-client-dev, libssl-dev, zlib1g-dev, wget, bzip2, libcurl4-gnutls-dev, git-core
+Maintainer: Andreas Öman <andreas@tvheadend.org>
+Build-Depends: debhelper (>= 7.0.50), pkg-config, libavahi-client-dev, libssl-dev, zlib1g-dev, wget, bzip2, libcurl4-gnutls-dev, git-core, liburiparser-dev
 Standards-Version: 3.7.3
 
 Package: tvheadend
 Architecture: any
-Depends: ${shlibs:Depends}, libavahi-client3, zlib1g
+Depends: ${shlibs:Depends}, libavahi-client3, zlib1g, liburiparser1
 Recommends: xmltv-util
 Enhances: showtime
 Replaces: hts-tvheadend
-Homepage: http://www.lonelycoder.com/tvheadend
+Homepage: https://tvheadend.org
 Description: Tvheadend
  Tvheadend is a TV streaming server for Linux supporting DVB, ATSC, IPTV, and Analog video (V4L) as input sources.
  Can be used as a backend to Showtime, XBMC and various other clients.

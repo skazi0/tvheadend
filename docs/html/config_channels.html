@@ -3,7 +3,7 @@
  <img src="docresources/channeltab.png">
 
  <div>
- The channels are listed / edited  in a grid. 
+ The channels are listed / edited in a grid. 
 
  <ul>
   <li>To edit a cell, double-click on it. After a cell is changed it
@@ -37,11 +37,12 @@
       player.
 
   <dt>EPG Grab Source
-  <dd>Name of the Internet based EPG provider (typically XMLTV) channel
+  <dd>Name of the Internet-based EPG provider (typically XMLTV) channel
       that should be used to update this channels EPG info.
       By default Tvheadend tries to match the name itself, but sometimes
       it might not match correctly in which case you can do the mapping
-      manually.
+      manually. When using XMLTV, a newly-mapped channel will not appear
+      in the EPG until the next run of the grabber, or service restart.
       <p>
       Over the air (OTA) sources do NOT need to be mapped in this way, the
       linking is implicitly tied since they are all part of the DVB system.

@@ -37,36 +37,47 @@
 #include <arpa/inet.h>
 
 #include "tvheadend.h"
+#include "api.h"
 #include "tcp.h"
 #include "access.h"
 #include "http.h"
 #include "webui/webui.h"
-#include "dvb/dvb.h"
 #include "epggrab.h"
 #include "spawn.h"
 #include "subscriptions.h"
-#include "serviceprobe.h"
-#include "cwc.h"
-#include "capmt.h"
+#include "service_mapper.h"
+#include "descrambler.h"
 #include "dvr/dvr.h"
 #include "htsp_server.h"
-#include "rawtsinput.h"
 #include "avahi.h"
-#include "iptv_input.h"
+#include "input.h"
 #include "service.h"
-#include "v4l.h"
 #include "trap.h"
 #include "settings.h"
-#include "ffdecsa/FFdecsa.h"
-#include "muxes.h"
-#include "config2.h"
+#include "config.h"
+#include "idnode.h"
 #include "imagecache.h"
 #include "timeshift.h"
+#include "fsmonitor.h"
+#include "lang_codes.h"
 #if ENABLE_LIBAV
 #include "libav.h"
+#include "plumbing/transcoding.h"
 #endif
 
+#ifdef PLATFORM_LINUX
+#include <sys/prctl.h>
+#endif
+
+pthread_t main_tid;
+
 /* Command line option struct */
+typedef struct str_list
+{
+  int max;
+  int num;
+  char **str;
+} str_list_t;
 typedef struct {
   const char  sopt;
   const char *lopt;
@@ -74,7 +85,8 @@ typedef struct {
   enum {
     OPT_STR,
     OPT_INT,
-    OPT_BOOL
+    OPT_BOOL, 
+    OPT_STR_LIST,
   }          type;
   void       *param;
 } cmdline_opt_t;
@@ -110,6 +122,7 @@ static cmdline_opt_t* cmdline_opt_find
 /*
  * Globals
  */
+int              tvheadend_running;
 int              tvheadend_webui_port;
 int              tvheadend_webui_debug;
 int              tvheadend_htsp_port;
@@ -126,11 +139,17 @@ const tvh_caps_t tvheadend_capabilities[] = {
 #if ENABLE_LINUXDVB
   { "linuxdvb", NULL },
 #endif
+#if ENABLE_LIBAV
+  { "transcoding", &transcoding_enabled },
+#endif
 #if ENABLE_IMAGECACHE
-  { "imagecache", &imagecache_enabled },
+  { "imagecache", (uint32_t*)&imagecache_conf.enabled },
 #endif
 #if ENABLE_TIMESHIFT
   { "timeshift", &timeshift_enabled },
+#endif
+#if ENABLE_TRACE
+  { "trace",     NULL },
 #endif
   { NULL, NULL }
 };
@@ -139,16 +158,13 @@ time_t dispatch_clock;
 pthread_mutex_t global_lock;
 pthread_mutex_t ffmpeg_lock;
 pthread_mutex_t fork_lock;
+pthread_mutex_t atomic_lock;
 
 /*
  * Locals
  */
-static int running;
-static int log_stderr;
-static int log_decorate;
 static LIST_HEAD(, gtimer) gtimers;
-static int log_debug_to_syslog;
-static int log_debug_to_console;
+static pthread_cond_t gtimer_cond;
 
 static void
 handle_sigpipe(int x)
@@ -156,10 +172,14 @@ handle_sigpipe(int x)
   return;
 }
 
-static void
+void
 doexit(int x)
 {
-  running = 0;
+  if (pthread_self() != main_tid)
+    pthread_kill(main_tid, SIGTERM);
+  pthread_cond_signal(&gtimer_cond);
+  tvheadend_running = 0;
+  signal(x, doexit);
 }
 
 static int
@@ -184,31 +204,52 @@ get_user_groups (const struct passwd *pw, gid_t* glist, size_t gmax)
 static int
 gtimercmp(gtimer_t *a, gtimer_t *b)
 {
-  if(a->gti_expire < b->gti_expire)
+  if(a->gti_expire.tv_sec  < b->gti_expire.tv_sec)
     return -1;
-  else if(a->gti_expire > b->gti_expire)
+  if(a->gti_expire.tv_sec  > b->gti_expire.tv_sec)
+    return 1;
+  if(a->gti_expire.tv_nsec < b->gti_expire.tv_nsec)
+    return -1;
+  if(a->gti_expire.tv_nsec > b->gti_expire.tv_nsec)
     return 1;
  return 0;
 }
-
 
 /**
  *
  */
 void
-gtimer_arm_abs(gtimer_t *gti, gti_callback_t *callback, void *opaque,
-	       time_t when)
+gtimer_arm_abs2
+  (gtimer_t *gti, gti_callback_t *callback, void *opaque, struct timespec *when)
 {
   lock_assert(&global_lock);
 
-  if(gti->gti_callback != NULL)
+  if (gti->gti_callback != NULL)
     LIST_REMOVE(gti, gti_link);
-    
+
   gti->gti_callback = callback;
-  gti->gti_opaque = opaque;
-  gti->gti_expire = when;
+  gti->gti_opaque   = opaque;
+  gti->gti_expire   = *when;
 
   LIST_INSERT_SORTED(&gtimers, gti, gti_link, gtimercmp);
+
+  //tvhdebug("gtimer", "%p @ %ld.%09ld", gti, when->tv_sec, when->tv_nsec);
+
+  if (LIST_FIRST(&gtimers) == gti)
+    pthread_cond_signal(&gtimer_cond); // force timer re-check
+}
+
+/**
+ *
+ */
+void
+gtimer_arm_abs
+  (gtimer_t *gti, gti_callback_t *callback, void *opaque, time_t when)
+{
+  struct timespec ts;
+  ts.tv_nsec = 0;
+  ts.tv_sec  = when;
+  gtimer_arm_abs2(gti, callback, opaque, &ts);
 }
 
 /**
@@ -217,10 +258,22 @@ gtimer_arm_abs(gtimer_t *gti, gti_callback_t *callback, void *opaque,
 void
 gtimer_arm(gtimer_t *gti, gti_callback_t *callback, void *opaque, int delta)
 {
-  time_t now;
-  time(&now);
-  
-  gtimer_arm_abs(gti, callback, opaque, now + delta);
+  gtimer_arm_abs(gti, callback, opaque, dispatch_clock + delta);
+}
+
+/**
+ *
+ */
+void
+gtimer_arm_ms
+  (gtimer_t *gti, gti_callback_t *callback, void *opaque, long delta_ms )
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  ts.tv_nsec += (1000000 * delta_ms);
+  ts.tv_sec  += (ts.tv_nsec / 1000000000);
+  ts.tv_nsec %= 1000000000;
+  gtimer_arm_abs2(gti, callback, opaque, &ts);
 }
 
 /**
@@ -230,6 +283,7 @@ void
 gtimer_disarm(gtimer_t *gti)
 {
   if(gti->gti_callback) {
+    //tvhdebug("gtimer", "%p disarm", gti);
     LIST_REMOVE(gti, gti_link);
     gti->gti_callback = NULL;
   }
@@ -254,8 +308,7 @@ show_usage
 {
   int i;
   char buf[256];
-  printf("Usage :- %s [options]\n\n", argv0);
-  printf("Options\n");
+  printf("Usage: %s [OPTIONS]\n", argv0);
   for (i = 0; i < num; i++) {
 
     /* Section */
@@ -268,14 +321,14 @@ show_usage
       char sopt[4];
       char *desc, *tok;
       if (opts[i].sopt)
-        snprintf(sopt, sizeof(sopt), "-%c/", opts[i].sopt);
+        snprintf(sopt, sizeof(sopt), "-%c,", opts[i].sopt);
       else
-        sopt[0] = 0;
-      snprintf(buf, sizeof(buf), "  %s--%s", sopt, opts[i].lopt);
+        strcpy(sopt, "   ");
+      snprintf(buf, sizeof(buf), "  %s --%s", sopt, opts[i].lopt);
       desc = strdup(opts[i].desc);
       tok  = strtok(desc, "\n");
       while (tok) {
-        printf("%s\t\t%s\n", buf, tok);
+        printf("%-30s%s\n", buf, tok);
         tok = buf;
         while (*tok) {
           *tok = ' ';
@@ -283,11 +336,12 @@ show_usage
         }
         tok = strtok(NULL, "\n");
       }
+      free(desc);
     }
   }
   printf("\n");
-  printf("For more information read the man page or visit\n");
-  printf(" http://www.lonelycoder.com/hts/\n");
+  printf("For more information please visit the Tvheadend website:\n");
+  printf("  https://tvheadend.org\n");
   printf("\n");
   exit(0);
 }
@@ -302,28 +356,60 @@ mainloop(void)
 {
   gtimer_t *gti;
   gti_callback_t *cb;
+  struct timespec ts;
 
-  while(running) {
-    sleep(1);
-    spawn_reaper();
+  while(tvheadend_running) {
+    clock_gettime(CLOCK_REALTIME, &ts);
 
-    time(&dispatch_clock);
+    /* 1sec stuff */
+    if (ts.tv_sec > dispatch_clock) {
+      dispatch_clock = ts.tv_sec;
 
-    comet_flush(); /* Flush idle comet mailboxes */
+      spawn_reaper(); /* reap spawned processes */
 
+      comet_flush(); /* Flush idle comet mailboxes */
+    }
+
+    /* Global timers */
     pthread_mutex_lock(&global_lock);
+
+    // TODO: there is a risk that if timers re-insert themselves to
+    //       the top of the list with a 0 offset we could loop indefinitely
     
+#if 0
+    tvhdebug("gtimer", "now %ld.%09ld", ts.tv_sec, ts.tv_nsec);
+    LIST_FOREACH(gti, &gtimers, gti_link)
+      tvhdebug("gtimer", "  gti %p expire %ld.%08ld",
+               gti, gti->gti_expire.tv_sec, gti->gti_expire.tv_nsec);
+#endif
+
     while((gti = LIST_FIRST(&gtimers)) != NULL) {
-      if(gti->gti_expire > dispatch_clock)
-	break;
       
+      if ((gti->gti_expire.tv_sec > ts.tv_sec) ||
+          ((gti->gti_expire.tv_sec == ts.tv_sec) &&
+           (gti->gti_expire.tv_nsec > ts.tv_nsec))) {
+        ts = gti->gti_expire;
+        break;
+      }
+
       cb = gti->gti_callback;
+      //tvhdebug("gtimer", "%p callback", gti);
+
       LIST_REMOVE(gti, gti_link);
       gti->gti_callback = NULL;
 
       cb(gti->gti_opaque);
-      
     }
+
+    /* Bound wait */
+    if ((LIST_FIRST(&gtimers) == NULL) || (ts.tv_sec > (dispatch_clock + 1))) {
+      ts.tv_sec  = dispatch_clock + 1;
+      ts.tv_nsec = 0;
+    }
+
+    /* Wait */
+    //tvhdebug("gtimer", "wait till %ld.%09ld", ts.tv_sec, ts.tv_nsec);
+    pthread_cond_timedwait(&gtimer_cond, &global_lock, &ts);
     pthread_mutex_unlock(&global_lock);
   }
 }
@@ -340,12 +426,21 @@ main(int argc, char **argv)
 #if ENABLE_LINUXDVB
   uint32_t adapter_mask;
 #endif
+  int  log_level   = LOG_INFO;
+  int  log_options = TVHLOG_OPT_MILLIS | TVHLOG_OPT_STDERR | TVHLOG_OPT_SYSLOG;
+  const char *log_debug = NULL, *log_trace = NULL;
+  char buf[512];
+
+  main_tid = pthread_self();
+
+  /* Setup global mutexes */
+  pthread_mutex_init(&ffmpeg_lock, NULL);
+  pthread_mutex_init(&fork_lock, NULL);
+  pthread_mutex_init(&global_lock, NULL);
+  pthread_mutex_init(&atomic_lock, NULL);
+  pthread_cond_init(&gtimer_cond, NULL);
 
   /* Defaults */
-  log_stderr                = 1;
-  log_decorate              = isatty(2);
-  log_debug_to_syslog       = 0;
-  log_debug_to_console      = 0;
   tvheadend_webui_port      = 9981;
   tvheadend_webroot         = NULL;
   tvheadend_htsp_port       = 9982;
@@ -356,21 +451,29 @@ main(int argc, char **argv)
               opt_version      = 0,
               opt_fork         = 0,
               opt_firstrun     = 0,
-              opt_debug        = 0,
+              opt_stderr       = 0,
               opt_syslog       = 0,
               opt_uidebug      = 0,
               opt_abort        = 0,
-              opt_ipv6         = 0;
+              opt_noacl        = 0,
+              opt_fileline     = 0,
+              opt_threadid     = 0,
+              opt_ipv6         = 0,
+              opt_tsfile_tuner = 0,
+              opt_dump         = 0;
   const char *opt_config       = NULL,
              *opt_user         = NULL,
              *opt_group        = NULL,
+             *opt_logpath      = NULL,
+             *opt_log_debug    = NULL,
+             *opt_log_trace    = NULL,
              *opt_pidpath      = "/var/run/tvheadend.pid",
 #if ENABLE_LINUXDVB
              *opt_dvb_adapters = NULL,
-             *opt_dvb_raw      = NULL,
 #endif
-             *opt_rawts        = NULL,
+             *opt_bindaddr     = NULL,
              *opt_subscribe    = NULL;
+  str_list_t  opt_tsfile       = { .max = 10, .num = 0, .str = calloc(10, sizeof(char*)) };
   cmdline_opt_t cmdline_opts[] = {
     {   0, NULL,        "Generic Options",         OPT_BOOL, NULL         },
     { 'h', "help",      "Show this page",          OPT_BOOL, &opt_help    },
@@ -382,18 +485,19 @@ main(int argc, char **argv)
     { 'u', "user",      "Run as user",             OPT_STR,  &opt_user    },
     { 'g', "group",     "Run as group",            OPT_STR,  &opt_group   },
     { 'p', "pid",       "Alternate pid path",      OPT_STR,  &opt_pidpath },
-    { 'C', "firstrun",  "If no useraccount exist then create one with\n"
+    { 'C', "firstrun",  "If no user account exists then create one with\n"
 	                      "no username and no password. Use with care as\n"
 	                      "it will allow world-wide administrative access\n"
 	                      "to your Tvheadend installation until you edit\n"
 	                      "the access-control from within the Tvheadend UI",
       OPT_BOOL, &opt_firstrun },
 #if ENABLE_LINUXDVB
-    { 'a', "adapters",  "Use only specified DVB adapters",
+    { 'a', "adapters",  "Only use specified DVB adapters (comma separated)",
       OPT_STR, &opt_dvb_adapters },
 #endif
     {   0, NULL,         "Server Connectivity",    OPT_BOOL, NULL         },
     { '6', "ipv6",       "Listen on IPv6",         OPT_BOOL, &opt_ipv6    },
+    { 'b', "bindaddr",   "Specify bind address",   OPT_STR,  &opt_bindaddr},
     {   0, "http_port",  "Specify alternative http port",
       OPT_INT, &tvheadend_webui_port },
     {   0, "http_root",  "Specify alternative http webroot",
@@ -404,18 +508,28 @@ main(int argc, char **argv)
       OPT_INT, &tvheadend_htsp_port_extra },
 
     {   0, NULL,        "Debug Options",           OPT_BOOL, NULL         },
-    { 'd', "debug",     "Enable all debug",        OPT_BOOL, &opt_debug   },
+    { 'd', "stderr",    "Enable debug on stderr",  OPT_BOOL, &opt_stderr  },
     { 's', "syslog",    "Enable debug to syslog",  OPT_BOOL, &opt_syslog  },
-    {   0, "uidebug",   "Enable webUI debug",      OPT_BOOL, &opt_uidebug },
-    { 'A', "abort",     "Immediately abort",       OPT_BOOL, &opt_abort   },
-#if ENABLE_LINUXDVB
-    { 'R', "dvbraw",    "Use rawts file to create virtual adapter",
-      OPT_STR, &opt_dvb_raw },
+    { 'l', "logfile",   "Enable debug to file",    OPT_STR,  &opt_logpath },
+    {   0, "debug",     "Enable debug subsystems", OPT_STR,  &opt_log_debug },
+#if ENABLE_TRACE
+    {   0, "trace",     "Enable trace subsystems", OPT_STR,  &opt_log_trace },
 #endif
-    { 'r', "rawts",     "Use rawts file to generate virtual services",
-      OPT_STR, &opt_rawts },
+    {   0, "fileline",  "Add file and line numbers to debug", OPT_BOOL, &opt_fileline },
+    {   0, "threadid",  "Add the thread ID to debug", OPT_BOOL, &opt_threadid },
+    {   0, "uidebug",   "Enable webUI debug (non-minified JS)", OPT_BOOL, &opt_uidebug },
+    { 'A', "abort",     "Immediately abort",       OPT_BOOL, &opt_abort   },
+    { 'D', "dump",      "Enable coredumps for daemon", OPT_BOOL, &opt_dump },
+    {   0, "noacl",     "Disable all access control checks",
+      OPT_BOOL, &opt_noacl },
     { 'j', "join",      "Subscribe to a service permanently",
-      OPT_STR, &opt_subscribe }
+      OPT_STR, &opt_subscribe },
+
+
+    { 0, NULL, "TODO: testing", OPT_BOOL, NULL },
+    { 0, "tsfile_tuners", "Number of tsfile tuners", OPT_INT, &opt_tsfile_tuner },
+    { 0, "tsfile", "tsfile input (mux file)", OPT_STR_LIST, &opt_tsfile },
+
   };
 
   /* Get current directory */
@@ -423,6 +537,7 @@ main(int argc, char **argv)
 
   /* Set locale */
   setlocale(LC_ALL, "");
+  setlocale(LC_NUMERIC, "C");
 
   /* make sure the timezone is set */
   tzset();
@@ -445,6 +560,11 @@ main(int argc, char **argv)
                  "option %s requires a value", opt->lopt);
     else if (opt->type == OPT_INT)
       *((int*)opt->param) = atoi(argv[i]);
+    else if (opt->type == OPT_STR_LIST) {
+      str_list_t *strl = opt->param;
+      if (strl->num < strl->max)
+        strl->str[strl->num++] = argv[i];
+    }
     else
       *((char**)opt->param) = argv[i];
 
@@ -456,25 +576,26 @@ main(int argc, char **argv)
   }
 
   /* Additional cmdline processing */
-  log_debug_to_console  = opt_debug;
-  log_debug_to_syslog   = opt_syslog;
-  tvheadend_webui_debug = opt_debug || opt_uidebug;
 #if ENABLE_LINUXDVB
   if (!opt_dvb_adapters) {
     adapter_mask = ~0;
   } else {
-    char *p, *r, *e;
+    char *p, *e;
+    char *r = NULL;
+    char *dvb_adapters = strdup(opt_dvb_adapters);
     adapter_mask = 0x0;
-    p = strtok_r((char*)opt_dvb_adapters, ",", &r);
+    p = strtok_r(dvb_adapters, ",", &r);
     while (p) {
       int a = strtol(p, &e, 10);
       if (*e != 0 || a < 0 || a > 31) {
         tvhlog(LOG_ERR, "START", "Invalid adapter number '%s'", p);
+        free(dvb_adapters);
         return 1;
       }
       adapter_mask |= (1 << a);
       p = strtok_r(NULL, ",", &r);
     }
+    free(dvb_adapters);
     if (!adapter_mask) {
       tvhlog(LOG_ERR, "START", "No adapters specified!");
       return 1;
@@ -486,7 +607,7 @@ main(int argc, char **argv)
     if (*tvheadend_webroot == '/')
       tmp = strdup(tvheadend_webroot);
     else {
-      tmp = malloc(strlen(tvheadend_webroot)+1);
+      tmp = malloc(strlen(tvheadend_webroot)+2);
       *tmp = '/';
       strcpy(tmp+1, tvheadend_webroot);
     }
@@ -494,7 +615,37 @@ main(int argc, char **argv)
       tmp[strlen(tmp)-1] = '\0';
     tvheadend_webroot = tmp;
   }
+  tvheadend_webui_debug = opt_uidebug;
 
+  /* Setup logging */
+  if (isatty(2))
+    log_options |= TVHLOG_OPT_DECORATE;
+  if (opt_stderr || opt_syslog || opt_logpath) {
+    if (!opt_log_trace && !opt_log_debug)
+      log_debug      = "all";
+    log_level      = LOG_DEBUG;
+    if (opt_stderr)
+      log_options   |= TVHLOG_OPT_DBG_STDERR;
+    if (opt_syslog)
+      log_options   |= TVHLOG_OPT_DBG_SYSLOG;
+    if (opt_logpath)
+      log_options   |= TVHLOG_OPT_DBG_FILE;
+  }
+  if (opt_fileline)
+    log_options |= TVHLOG_OPT_FILELINE;
+  if (opt_threadid)
+    log_options |= TVHLOG_OPT_THREAD;
+  if (opt_log_trace) {
+    log_level  = LOG_TRACE;
+    log_trace  = opt_log_trace;
+  }
+  if (opt_log_debug)
+    log_debug  = opt_log_debug;
+    
+  tvhlog_init(log_level, log_options, opt_logpath);
+  tvhlog_set_debug(log_debug);
+  tvhlog_set_trace(log_trace);
+ 
   signal(SIGPIPE, handle_sigpipe); // will be redundant later
 
   /* Daemonise */
@@ -503,7 +654,7 @@ main(int argc, char **argv)
     gid_t gid;
     uid_t uid;
     struct group  *grp = getgrnam(opt_group ?: "video");
-    struct passwd *pw  = getpwnam(opt_user) ?: NULL;
+    struct passwd *pw  = opt_user ? getpwnam(opt_user) : NULL;
     FILE   *pidfile    = fopen(opt_pidpath, "w+");
 
     if(grp != NULL) {
@@ -548,23 +699,33 @@ main(int argc, char **argv)
       fclose(pidfile);
     }
 
+    /* Make dumpable */
+    if (opt_dump) {
+#ifdef PLATFORM_LINUX
+      if (chdir("/tmp"))
+        tvhwarn("START", "failed to change cwd to /tmp");
+      prctl(PR_SET_DUMPABLE, 1);
+#else
+      tvhwarn("START", "Coredumps not implemented on your platform");
+#endif
+    }
+
     umask(0);
   }
 
-  /* Setup logging */
-  log_stderr   = !opt_fork;
-  log_decorate = isatty(2);
-  openlog("tvheadend", LOG_PID, LOG_DAEMON);
+  tvheadend_running = 1;
 
-  /* Initialise configuration */
-  hts_settings_init(opt_config);
+  /* Start log thread (must be done post fork) */
+  tvhlog_start();
 
-  /* Setup global mutexes */
-  pthread_mutex_init(&ffmpeg_lock, NULL);
-  pthread_mutex_init(&fork_lock, NULL);
-  pthread_mutex_init(&global_lock, NULL);
+  /* Alter logging */
+  if (opt_fork)
+    tvhlog_options &= ~TVHLOG_OPT_STDERR;
+  if (!isatty(2))
+    tvhlog_options &= ~TVHLOG_OPT_DECORATE;
+  
+  /* Initialise clock */
   pthread_mutex_lock(&global_lock);
-
   time(&dispatch_clock);
 
   /* Signal handling */
@@ -572,71 +733,76 @@ main(int argc, char **argv)
   sigprocmask(SIG_BLOCK, &set, NULL);
   trap_init(argv[0]);
   
+  /* Initialise configuration */
+  uuid_init();
+  idnode_init();
+  config_init(opt_config);
+
   /**
    * Initialize subsystems
    */
+  
+  api_init();
+
+  fsmonitor_init();
 
 #if ENABLE_LIBAV
   libav_init();
+  transcoding_init();
 #endif
-
-  config_init();
 
   imagecache_init();
 
   service_init();
 
-  channels_init();
+#if ENABLE_TSFILE
+  if(opt_tsfile.num) {
+    tsfile_init(opt_tsfile_tuner ?: opt_tsfile.num);
+    for (i = 0; i < opt_tsfile.num; i++)
+      tsfile_add_file(opt_tsfile.str[i]);
+  }
+#endif
+#if ENABLE_MPEGTS_DVB
+  dvb_network_init();
+#endif
+#if ENABLE_IPTV
+  iptv_init();
+#endif
+#if ENABLE_LINUXDVB
+  linuxdvb_init(adapter_mask);
+#endif
+
+  channel_init();
 
   subscription_init();
 
-  access_init(opt_firstrun);
-
-#if ENABLE_LINUXDVB
-  muxes_init();
-  dvb_init(adapter_mask, opt_dvb_raw);
-#endif
-
-  iptv_input_init();
-
-#if ENABLE_V4L
-  v4l_init();
-#endif
+  access_init(opt_firstrun, opt_noacl);
 
 #if ENABLE_TIMESHIFT
   timeshift_init();
 #endif
 
+  http_client_init();
   tcp_server_init(opt_ipv6);
-  http_server_init();
+  http_server_init(opt_bindaddr);
   webui_init();
 
-  serviceprobe_init();
+  service_mapper_init();
 
-#if ENABLE_CWC
-  cwc_init();
-  capmt_init();
-#if (!ENABLE_DVBCSA)
-  ffdecsa_init();
-#endif
-#endif
+  descrambler_init();
 
   epggrab_init();
   epg_init();
 
   dvr_init();
 
-  htsp_init();
+  htsp_init(opt_bindaddr);
 
-  if(opt_rawts != NULL)
-    rawts_init(opt_rawts);
 
   if(opt_subscribe != NULL)
     subscription_dummy_join(opt_subscribe, 1);
 
-#ifdef CONFIG_AVAHI
   avahi_init();
-#endif
 
   epg_updated(); // cleanup now all prev ref's should have been created
 
@@ -646,7 +812,6 @@ main(int argc, char **argv)
    * Wait for SIGTERM / SIGINT, but only in this thread
    */
 
-  running = 1;
   sigemptyset(&set);
   sigaddset(&set, SIGTERM);
   sigaddset(&set, SIGINT);
@@ -657,132 +822,74 @@ main(int argc, char **argv)
   pthread_sigmask(SIG_UNBLOCK, &set, NULL);
 
   tvhlog(LOG_NOTICE, "START", "HTS Tvheadend version %s started, "
-	 "running as PID:%d UID:%d GID:%d, settings located in '%s'",
-	 tvheadend_version,
-	 getpid(), getuid(), getgid(), hts_settings_get_root());
+         "running as PID:%d UID:%d GID:%d, CWD:%s CNF:%s",
+         tvheadend_version,
+         getpid(), getuid(), getgid(), getcwd(buf, sizeof(buf)),
+         hts_settings_get_root());
 
   if(opt_abort)
     abort();
 
   mainloop();
 
-  epg_save();
-
-#if ENABLE_TIMESHIFT
-  timeshift_term();
+  tvhftrace("main", htsp_done);
+  tvhftrace("main", http_server_done);
+  tvhftrace("main", webui_done);
+  tvhftrace("main", http_client_done);
+  tvhftrace("main", fsmonitor_done);
+#if ENABLE_MPEGTS_DVB
+  tvhftrace("main", dvb_network_done);
+#endif
+#if ENABLE_IPTV
+  tvhftrace("main", iptv_done);
+#endif
+#if ENABLE_LINUXDVB
+  tvhftrace("main", linuxdvb_done);
+#endif
+#if ENABLE_TSFILE
+  tvhftrace("main", tsfile_done);
 #endif
 
+  // Note: the locking is obviously a bit redundant, but without
+  //       we need to disable the gtimer_arm call in epg_save()
+  pthread_mutex_lock(&global_lock);
+  tvhftrace("main", epg_save);
+
+#if ENABLE_TIMESHIFT
+  tvhftrace("main", timeshift_term);
+#endif
+  pthread_mutex_unlock(&global_lock);
+
+  tvhftrace("main", epggrab_done);
+  tvhftrace("main", tcp_server_done);
+  tvhftrace("main", descrambler_done);
+  tvhftrace("main", service_mapper_done);
+  tvhftrace("main", service_done);
+  tvhftrace("main", channel_done);
+  tvhftrace("main", dvr_done);
+  tvhftrace("main", subscription_done);
+  tvhftrace("main", access_done);
+  tvhftrace("main", epg_done);
+  tvhftrace("main", avahi_done);
+  tvhftrace("main", imagecache_done);
+  tvhftrace("main", idnode_done);
+  tvhftrace("main", lang_code_done);
+  tvhftrace("main", api_done);
+  tvhftrace("main", config_done);
+  tvhftrace("main", hts_settings_done);
+  tvhftrace("main", dvb_done);
+  tvhftrace("main", lang_str_done);
+
   tvhlog(LOG_NOTICE, "STOP", "Exiting HTS Tvheadend");
+  tvhlog_end();
 
   if(opt_fork)
     unlink(opt_pidpath);
+    
+  free(opt_tsfile.str);
 
   return 0;
-
 }
-
-
-static const char *logtxtmeta[8][2] = {
-  {"EMERGENCY", "\033[31m"},
-  {"ALERT",     "\033[31m"},
-  {"CRITICAL",  "\033[31m"},
-  {"ERROR",     "\033[31m"},
-  {"WARNING",   "\033[33m"},
-  {"NOTICE",    "\033[36m"},
-  {"INFO",      "\033[32m"},
-  {"DEBUG",     "\033[32m"},
-};
-
-/**
- * Internal log function
- */
-static void
-tvhlogv(int notify, int severity, const char *subsys, const char *fmt, 
-	va_list ap)
-{
-  char buf[2048];
-  char buf2[2048];
-  char t[50];
-  int l;
-  struct tm tm;
-  time_t now;
-
-  l = snprintf(buf, sizeof(buf), "%s: ", subsys);
-
-  vsnprintf(buf + l, sizeof(buf) - l, fmt, ap);
-
-  if(log_debug_to_syslog || severity < LOG_DEBUG)
-    syslog(severity, "%s", buf);
-
-  /**
-   * Get time (string)
-   */
-  time(&now);
-  localtime_r(&now, &tm);
-  strftime(t, sizeof(t), "%b %d %H:%M:%S", &tm);
-
-  /**
-   * Send notification to Comet (Push interface to web-clients)
-   */
-  if(notify) {
-    htsmsg_t *m;
-
-    snprintf(buf2, sizeof(buf2), "%s %s", t, buf);
-    m = htsmsg_create_map();
-    htsmsg_add_str(m, "notificationClass", "logmessage");
-    htsmsg_add_str(m, "logtxt", buf2);
-    comet_mailbox_add_message(m, severity == LOG_DEBUG);
-    htsmsg_destroy(m);
-  }
-
-  /**
-   * Write to stderr
-   */
-  
-  if(log_stderr && (log_debug_to_console || severity < LOG_DEBUG)) {
-    const char *leveltxt = logtxtmeta[severity][0];
-    const char *sgr      = logtxtmeta[severity][1];
-    const char *sgroff;
-
-    if(!log_decorate) {
-      sgr = "";
-      sgroff = "";
-    } else {
-      sgroff = "\033[0m";
-    }
-    fprintf(stderr, "%s%s [%s]:%s%s\n", sgr, t, leveltxt, buf, sgroff);
-  }
-}
-
-
-/**
- *
- */
-void
-tvhlog(int severity, const char *subsys, const char *fmt, ...)
-{
-  va_list ap;
-  va_start(ap, fmt);
-  tvhlogv(1, severity, subsys, fmt, ap);
-  va_end(ap);
-}
-
-
-/**
- * May be invoked from a forked process so we can't do any notification
- * to comet directly.
- *
- * @todo Perhaps do it via a pipe?
- */
-void
-tvhlog_spawn(int severity, const char *subsys, const char *fmt, ...)
-{
-  va_list ap;
-  va_start(ap, fmt);
-  tvhlogv(0, severity, subsys, fmt, ap);
-  va_end(ap);
-}
-
 
 /**
  *

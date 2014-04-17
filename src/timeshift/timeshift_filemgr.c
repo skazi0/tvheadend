@@ -18,7 +18,6 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/epoll.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <string.h>
@@ -29,7 +28,7 @@
 #include "streaming.h"
 #include "timeshift.h"
 #include "timeshift/private.h"
-#include "config2.h"
+#include "config.h"
 #include "settings.h"
 #include "atomic.h"
 
@@ -64,9 +63,7 @@ static void* timeshift_reaper_callback ( void *p )
     TAILQ_REMOVE(&timeshift_reaper_list, tsf, link);
     pthread_mutex_unlock(&timeshift_reaper_lock);
 
-#ifdef TSHFT_TRACE
-    tvhlog(LOG_DEBUG, "timeshift", "remove file %s", tsf->path);
-#endif
+    tvhtrace("timeshift", "remove file %s", tsf->path);
 
     /* Remove */
     unlink(tsf->path);
@@ -75,7 +72,6 @@ static void* timeshift_reaper_callback ( void *p )
       if (errno != ENOTEMPTY)
         tvhlog(LOG_ERR, "timeshift", "failed to remove %s [e=%s]",
                dpath, strerror(errno));
-    atomic_add_u64(&timeshift_total_size, -tsf->size);
 
     /* Free memory */
     while ((ti = TAILQ_FIRST(&tsf->iframes))) {
@@ -92,17 +88,13 @@ static void* timeshift_reaper_callback ( void *p )
     free(tsf);
   }
   pthread_mutex_unlock(&timeshift_reaper_lock);
-#ifdef TSHFT_TRACE
-  tvhlog(LOG_DEBUG, "timeshift", "reaper thread exit");
-#endif
+  tvhtrace("timeshift", "reaper thread exit");
   return NULL;
 }
 
 static void timeshift_reaper_remove ( timeshift_file_t *tsf )
 {
-#ifdef TSHFT_TRACE
-  tvhlog(LOG_DEBUG, "timeshift", "queue file for removal %s", tsf->path);
-#endif
+  tvhtrace("timeshift", "queue file for removal %s", tsf->path);
   pthread_mutex_lock(&timeshift_reaper_lock);
   TAILQ_INSERT_TAIL(&timeshift_reaper_list, tsf, link);
   pthread_cond_signal(&timeshift_reaper_cond);
@@ -118,15 +110,16 @@ static void timeshift_reaper_remove ( timeshift_file_t *tsf )
  *
  * TODO: should this be fixed on startup?
  */
-static void timeshift_filemgr_get_root ( char *buf, size_t len )
+static int
+timeshift_filemgr_get_root ( char *buf, size_t len )
 {
   const char *path = timeshift_path;
   if (!path || !*path) {
-    path = hts_settings_get_root();
-    snprintf(buf, len, "%s/timeshift/buffer", path);
+    return hts_settings_buildpath(buf, len, "timeshift/buffer");
   } else {
     snprintf(buf, len, "%s/buffer", path);
   }
+  return 0;
 }
 
 /*
@@ -134,7 +127,8 @@ static void timeshift_filemgr_get_root ( char *buf, size_t len )
  */
 int timeshift_filemgr_makedirs ( int index, char *buf, size_t len )
 {
-  timeshift_filemgr_get_root(buf, len);
+  if (timeshift_filemgr_get_root(buf, len))
+    return 1;
   snprintf(buf+strlen(buf), len-strlen(buf), "/%d", index);
   return makedirs(buf, 0700);
 }
@@ -162,7 +156,9 @@ void timeshift_filemgr_remove
 {
   if (tsf->fd != -1)
     close(tsf->fd);
+  tvhlog(LOG_DEBUG, "timeshift", "ts %d remove %s", ts->id, tsf->path);
   TAILQ_REMOVE(&ts->files, tsf, link);
+  atomic_add_u64(&timeshift_total_size, -tsf->size);
   timeshift_reaper_remove(tsf);
 }
 
@@ -192,7 +188,7 @@ timeshift_file_t *timeshift_filemgr_get ( timeshift_t *ts, int create )
 
   /* Return last file */
   if (!create)
-    return TAILQ_LAST(&ts->files, timeshift_file_list);
+    return timeshift_filemgr_newest(ts);
 
   /* No space */
   if (ts->full)
@@ -215,10 +211,9 @@ timeshift_file_t *timeshift_filemgr_get ( timeshift_t *ts, int create )
       if (d > (ts->max_time+5)) {
         if (!tsf_hd->refcount) {
           timeshift_filemgr_remove(ts, tsf_hd, 0);
+          tsf_hd = NULL;
         } else {
-#ifdef TSHFT_TRACE
           tvhlog(LOG_DEBUG, "timeshift", "ts %d buffer full", ts->id);
-#endif
           ts->full = 1;
         }
       }
@@ -226,9 +221,17 @@ timeshift_file_t *timeshift_filemgr_get ( timeshift_t *ts, int create )
 
     /* Check size */
     if (!timeshift_unlimited_size &&
-        atomic_add_u64(&timeshift_total_size, 0) >= timeshift_max_size) {
-      tvhlog(LOG_DEBUG, "timshift", "ts %d buffer full", ts->id);
-      ts->full = 1;
+        atomic_pre_add_u64(&timeshift_total_size, 0) >= timeshift_max_size) {
+
+      /* Remove the last file (if we can) */
+      if (tsf_hd && !tsf_hd->refcount) {
+        timeshift_filemgr_remove(ts, tsf_hd, 0);
+
+      /* Full */
+      } else {
+        tvhlog(LOG_DEBUG, "timeshift", "ts %d buffer full", ts->id);
+        ts->full = 1;
+      }
     }
       
     /* Create new file */
@@ -244,9 +247,7 @@ timeshift_file_t *timeshift_filemgr_get ( timeshift_t *ts, int create )
 
       /* Create File */
       snprintf(path, sizeof(path), "%s/tvh-%"PRItime_t, ts->path, time);
-#ifdef TSHFT_TRACE
-      tvhlog(LOG_DEBUG, "timeshift", "ts %d create file %s", ts->id, path);
-#endif
+      tvhtrace("timeshift", "ts %d create file %s", ts->id, path);
       if ((fd = open(path, O_WRONLY | O_CREAT, 0600)) > 0) {
         tsf_tmp = calloc(1, sizeof(timeshift_file_t));
         tsf_tmp->time     = time;
@@ -260,10 +261,8 @@ timeshift_file_t *timeshift_filemgr_get ( timeshift_t *ts, int create )
 
         /* Copy across last start message */
         if (tsf_tl && (ti = TAILQ_LAST(&tsf_tl->sstart, timeshift_index_data_list))) {
-#ifdef TSHFT_TRACE
-          tvhlog(LOG_DEBUG, "timeshift", "ts %d copy smt_start to new file",
-                 ts->id);
-#endif
+          tvhtrace("timeshift", "ts %d copy smt_start to new file",
+                   ts->id);
           timeshift_index_data_t *ti2 = calloc(1, sizeof(timeshift_index_data_t));
           ti2->data = streaming_msg_clone(ti->data);
           TAILQ_INSERT_TAIL(&tsf_tmp->sstart, ti2, link);
@@ -273,6 +272,8 @@ timeshift_file_t *timeshift_filemgr_get ( timeshift_t *ts, int create )
     tsf_tl = tsf_tmp;
   }
 
+  if (tsf_tl)
+    tsf_tl->refcount++;
   return tsf_tl;
 }
 
@@ -303,11 +304,24 @@ timeshift_file_t *timeshift_filemgr_prev
 /*
  * Get the oldest file
  */
-timeshift_file_t *timeshift_filemgr_last ( timeshift_t *ts )
+timeshift_file_t *timeshift_filemgr_oldest ( timeshift_t *ts )
 {
-  return TAILQ_FIRST(&ts->files);
+  timeshift_file_t *tsf = TAILQ_FIRST(&ts->files);
+  if (tsf)
+    tsf->refcount++;
+  return tsf;
 }
 
+/*
+ * Get the newest file
+ */
+timeshift_file_t *timeshift_filemgr_newest ( timeshift_t *ts )
+{
+  timeshift_file_t *tsf = TAILQ_LAST(&ts->files, timeshift_file_list);
+  if (tsf)
+    tsf->refcount++;
+  return tsf;
+}
 
 /* **************************************************************************
  * Setup / Teardown
@@ -321,8 +335,8 @@ void timeshift_filemgr_init ( void )
   char path[512];
 
   /* Try to remove any rubbish left from last run */
-  timeshift_filemgr_get_root(path, sizeof(path));
-  rmtree(path);
+  if(!timeshift_filemgr_get_root(path, sizeof(path)))
+    rmtree(path);
 
   /* Size processing */
   timeshift_total_size = 0;
@@ -332,8 +346,8 @@ void timeshift_filemgr_init ( void )
   pthread_mutex_init(&timeshift_reaper_lock, NULL);
   pthread_cond_init(&timeshift_reaper_cond, NULL);
   TAILQ_INIT(&timeshift_reaper_list);
-  pthread_create(&timeshift_reaper_thread, NULL,
-                 timeshift_reaper_callback, NULL);
+  tvhthread_create(&timeshift_reaper_thread, NULL,
+                 timeshift_reaper_callback, NULL, 1);
 }
 
 /*
@@ -351,8 +365,8 @@ void timeshift_filemgr_term ( void )
   pthread_join(timeshift_reaper_thread, NULL);
 
   /* Remove the lot */
-  timeshift_filemgr_get_root(path, sizeof(path));
-  rmtree(path);
+  if (!timeshift_filemgr_get_root(path, sizeof(path)))
+    rmtree(path);
 }
 
 

@@ -21,16 +21,21 @@
 #include "timeshift.h"
 #include "timeshift/private.h"
 #include "atomic.h"
+#include "tvhpoll.h"
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/epoll.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <string.h>
 #include <assert.h>
 
-//#define TSHFT_TRACE
+#if ENABLE_EPOLL
+#include <sys/epoll.h>
+#elif ENABLE_KQUEUE
+#include <sys/event.h>
+#include <sys/time.h>
+#endif
 
 /* **************************************************************************
  * File Reading
@@ -192,10 +197,11 @@ static timeshift_index_iframe_t *_timeshift_first_frame
 { 
   int end;
   timeshift_index_iframe_t *tsi = NULL;
-  timeshift_file_t *tsf = timeshift_filemgr_last(ts);
+  timeshift_file_t *tsf = timeshift_filemgr_oldest(ts);
   while (tsf && !tsi) {
-    if (!(tsi = TAILQ_FIRST(&tsf->iframes)))
+    if (!(tsi = TAILQ_FIRST(&tsf->iframes))) {
       tsf = timeshift_filemgr_next(tsf, &end, 0);
+    }
   }
   if (tsf)
     tsf->refcount--;
@@ -209,8 +215,9 @@ static timeshift_index_iframe_t *_timeshift_last_frame
   timeshift_index_iframe_t *tsi = NULL;
   timeshift_file_t *tsf = timeshift_filemgr_get(ts, 0);
   while (tsf && !tsi) {
-    if (!(tsi = TAILQ_LAST(&tsf->iframes, timeshift_index_iframe_list)))
+    if (!(tsi = TAILQ_LAST(&tsf->iframes, timeshift_index_iframe_list))) {
       tsf = timeshift_filemgr_prev(tsf, &end, 0);
+    }
   }
   if (tsf)
     tsf->refcount--;
@@ -227,6 +234,10 @@ static int _timeshift_skip
   int64_t                   sec  = req_time / (1000000 * TIMESHIFT_FILE_PERIOD);
   int                       back = (req_time < cur_time) ? 1 : 0;
   int                       end  = 0;
+  
+  /* Hold local ref */
+  if (cur_file)
+    cur_file->refcount++;
 
   /* Coarse search */
   if (!tsi) {
@@ -272,7 +283,7 @@ static int _timeshift_skip
   /* Find start/end of buffer */
   if (end) {
     if (back) {
-      tsf = timeshift_filemgr_last(ts);
+      tsf = timeshift_filemgr_oldest(ts);
       tsi = NULL;
       while (tsf && !tsi) {
         if (!(tsi = TAILQ_FIRST(&tsf->iframes)))
@@ -289,6 +300,9 @@ static int _timeshift_skip
       end = 1;
     }
   }
+
+  if (cur_file)
+    cur_file->refcount--;
 
   /* Done */
   *new_file = tsf;
@@ -307,18 +321,12 @@ static int _timeshift_read
 
     /* Open file */
     if (*fd == -1) {
-#ifdef TSHFT_TRACE
-      tvhlog(LOG_DEBUG, "timeshift", "ts %d open file %s",
-             ts->id, (*cur_file)->path);
-#endif
+      tvhtrace("timeshift", "ts %d open file %s",
+               ts->id, (*cur_file)->path);
       *fd = open((*cur_file)->path, O_RDONLY);
     }
-    if (*cur_off) {
-#ifdef TSHFT_TRACE
-      tvhlog(LOG_DEBUG, "timeshift", "ts %d seek to %lu", ts->id, *cur_off);
-#endif
-      lseek(*fd, *cur_off, SEEK_SET);
-    }
+    tvhtrace("timeshift", "ts %d seek to %"PRIoff_t, ts->id, *cur_off);
+    lseek(*fd, *cur_off, SEEK_SET);
 
     /* Read msg */
     ssize_t r = _read_msg(*fd, sm);
@@ -328,10 +336,8 @@ static int _timeshift_read
       tvhlog(LOG_ERR, "timeshift", "ts %d could not read buffer", ts->id);
       return -1;
     }
-#ifdef TSHFT_TRACE
-    tvhlog(LOG_DEBUG, "timeshift", "ts %d read msg %p (%ld)",
-           ts->id, *sm, r);
-#endif
+    tvhtrace("timeshift", "ts %d read msg %p (%"PRIssize_t")",
+             ts->id, *sm, r);
 
     /* Incomplete */
     if (r == 0) {
@@ -346,7 +352,9 @@ static int _timeshift_read
     if (r == sizeof(size_t) || *cur_off > (*cur_file)->size) {
       close(*fd);
       *fd       = -1;
+      pthread_mutex_lock(&ts->rdwr_mutex);
       *cur_file = timeshift_filemgr_next(*cur_file, NULL, 0);
+      pthread_mutex_unlock(&ts->rdwr_mutex);
       *cur_off  = 0; // reset
       *wait     = 0;
 
@@ -354,7 +362,6 @@ static int _timeshift_read
     } else {
       streaming_message_t *ssm = _timeshift_find_sstart(*cur_file, (*sm)->sm_time);
       if (ssm && ssm->sm_data != ts->smt_start) {
-        printf("SENDING NEW SMT_START MESSAGE\n");
         streaming_target_deliver2(ts->output, streaming_msg_clone(ssm));
         if (ts->smt_start)
           streaming_start_unref(ts->smt_start);
@@ -400,7 +407,7 @@ static int _timeshift_flush_to_live
 void *timeshift_reader ( void *p )
 {
   timeshift_t *ts = p;
-  int efd, nfds, end, fd = -1, run = 1, wait = -1;
+  int nfds, end, fd = -1, run = 1, wait = -1;
   timeshift_file_t *cur_file = NULL;
   off_t cur_off = 0;
   int cur_speed = 100, keyframe_mode = 0;
@@ -410,13 +417,13 @@ void *timeshift_reader ( void *p )
   timeshift_index_iframe_t *tsi = NULL;
   streaming_skip_t *skip = NULL;
   time_t last_status = 0;
+  tvhpoll_t *pd;
+  tvhpoll_event_t ev = { 0 };
 
-  /* Poll */
-  struct epoll_event ev = { 0 };
-  efd        = epoll_create(1);
-  ev.events  = EPOLLIN;
-  ev.data.fd = ts->rd_pipe.rd;
-  epoll_ctl(efd, EPOLL_CTL_ADD, ev.data.fd, &ev);
+  pd = tvhpoll_create(1);
+  ev.fd     = ts->rd_pipe.rd;
+  ev.events = TVHPOLL_IN;
+  tvhpoll_add(pd, &ev, 1);
 
   /* Output */
   while (run) {
@@ -428,7 +435,7 @@ void *timeshift_reader ( void *p )
 
     /* Wait for data */
     if(wait)
-      nfds = epoll_wait(efd, &ev, 1, wait);
+      nfds = tvhpoll_wait(pd, &ev, 1, wait);
     else
       nfds = 0;
     wait      = -1;
@@ -439,13 +446,11 @@ void *timeshift_reader ( void *p )
     /* Control */
     pthread_mutex_lock(&ts->state_mutex);
     if (nfds == 1) {
-      if (_read_msg(ev.data.fd, &ctrl) > 0) {
+      if (_read_msg(ts->rd_pipe.rd, &ctrl) > 0) {
 
         /* Exit */
         if (ctrl->sm_type == SMT_EXIT) {
-#ifdef TSHFT_TRACE
-          tvhlog(LOG_DEBUG, "timeshift", "ts %d read exit request", ts->id);
-#endif
+          tvhtrace("timeshift", "ts %d read exit request", ts->id);
           run = 0;
           streaming_msg_free(ctrl);
           ctrl = NULL;
@@ -526,6 +531,27 @@ void *timeshift_reader ( void *p )
         } else if (ctrl->sm_type == SMT_SKIP) {
           skip = ctrl->sm_data;
           switch (skip->type) {
+            case SMT_SKIP_LIVE:
+              if (ts->state != TS_LIVE) {
+
+                /* Reset */
+                if (ts->full) {
+                  pthread_mutex_lock(&ts->rdwr_mutex);
+                  timeshift_filemgr_flush(ts, NULL);
+                  ts->full = 0;
+                  pthread_mutex_unlock(&ts->rdwr_mutex);
+                }
+
+                /* Release */
+                if (sm)
+                  streaming_msg_free(sm);
+
+                /* Find end */
+                skip_time = 0x7fffffffffffffffLL;
+                // TODO: change this sometime!
+              }
+              break;
+
             case SMT_SKIP_ABS_TIME:
               if (ts->pts_delta == PTS_UNSET) {
                 tvhlog(LOG_ERR, "timeshift", "ts %d abs skip not possible no PTS delta", ts->id);
@@ -537,7 +563,7 @@ void *timeshift_reader ( void *p )
 
               /* Convert */
               skip_time =  ts_rescale(skip->time, 1000000);
-              tvhlog(LOG_DEBUG, "timeshift", "ts %d skip %"PRId64" requested", ts->id, skip->time);
+              tvhlog(LOG_DEBUG, "timeshift", "ts %d skip %"PRId64" requested %"PRId64, ts->id, skip_time, skip->time);
 
               /* Live playback (stage1) */
               if (ts->state == TS_LIVE) {
@@ -554,7 +580,8 @@ void *timeshift_reader ( void *p )
 
               /* May have failed */
               if (skip) {
-                tvhlog(LOG_DEBUG, "timeshift", "ts %d skip last_time %"PRId64, ts->id, last_time);
+                tvhlog(LOG_DEBUG, "timeshift", "ts %d skip last_time %"PRId64" pts_delta %"PRId64,
+                       ts->id, last_time, ts->pts_delta);
                 skip_time += (skip->type == SMT_SKIP_ABS_TIME) ? ts->pts_delta : last_time;
 
                /* Live (stage2) */
@@ -631,9 +658,6 @@ void *timeshift_reader ( void *p )
       continue;
     }
 
-    /* File processing lock */
-    pthread_mutex_lock(&ts->rdwr_mutex);
-
     /* Calculate delivery time */
     deliver = (now - play_time) + TIMESHIFT_PLAY_BUF;
     deliver = (deliver * cur_speed) / 100;
@@ -655,8 +679,10 @@ void *timeshift_reader ( void *p )
         tvhlog(LOG_DEBUG, "timeshift", "ts %d skip to %"PRId64" from %"PRId64, ts->id, req_time, last_time);
 
         /* Find */
+        pthread_mutex_lock(&ts->rdwr_mutex);
         end = _timeshift_skip(ts, req_time, last_time,
                               cur_file, &tsf, &tsi);
+        pthread_mutex_unlock(&ts->rdwr_mutex);
         if (tsi)
           tvhlog(LOG_DEBUG, "timeshift", "ts %d skip found pkt @ %"PRId64, ts->id, tsi->time);
 
@@ -667,6 +693,8 @@ void *timeshift_reader ( void *p )
         }
 
         /* Position */
+        if (cur_file)
+          cur_file->refcount--;
         cur_file = tsf;
         if (tsi)
           cur_off = tsi->pos;
@@ -676,7 +704,6 @@ void *timeshift_reader ( void *p )
 
       /* Find packet */
       if (_timeshift_read(ts, &cur_file, &cur_off, &fd, &sm, &wait) == -1) {
-        pthread_mutex_unlock(&ts->rdwr_mutex);
         pthread_mutex_unlock(&ts->state_mutex);
         break;
       }
@@ -704,16 +731,20 @@ void *timeshift_reader ( void *p )
                (((cur_speed < 0) && (sm->sm_time >= deliver)) ||
                ((cur_speed > 0) && (sm->sm_time <= deliver))))) {
 
-#ifndef TSHFT_TRACE
-      if (skip)
+      if (sm->sm_type == SMT_PACKET) {
+#if ENABLE_TRACE
+        th_pkt_t *pkt = sm->sm_data;
+        tvhtrace("timeshift",
+                 "ts %d pkt out - stream %d type %c pts %10"PRId64
+                 " dts %10"PRId64 " dur %10d len %"PRIsize_t" time %"PRId64,
+                 ts->id,
+                 pkt->pkt_componentindex,
+                 pkt_frametype_to_char(pkt->pkt_frametype),
+                 ts_rescale(pkt->pkt_pts, 1000000),
+                 ts_rescale(pkt->pkt_dts, 1000000),
+                 pkt->pkt_duration,
+                 pktbuf_len(pkt->pkt_payload), sm->sm_time);
 #endif
-      {
-        time_t pts = 0;
-        int64_t delta = now - sm->sm_time;
-        if (sm->sm_type == SMT_PACKET)
-          pts = ((th_pkt_t*)sm->sm_data)->pkt_pts;
-        tvhlog(LOG_DEBUG, "timeshift", "ts %d deliver %"PRId64" pts=%"PRItime_t " shift=%"PRIu64,
-               ts->id, sm->sm_time, pts, delta);
       }
       streaming_target_deliver2(ts->output, sm);
       last_time = sm->sm_time;
@@ -725,10 +756,8 @@ void *timeshift_reader ( void *p )
       else
         wait = (deliver - sm->sm_time) / 1000;
       if (wait == 0) wait = 1;
-#ifdef TSHFT_TRACE
-      tvhlog(LOG_DEBUG, "timeshift", "ts %d wait %d",
-             ts->id, wait);
-#endif
+      tvhtrace("timeshift", "ts %d wait %d",
+               ts->id, wait);
     }
 
     /* Terminate */
@@ -736,8 +765,8 @@ void *timeshift_reader ( void *p )
       if (!end)
         end = (cur_speed > 0) ? 1 : -1;
 
-      /* Back to live */
-      if (end == 1) {
+      /* Back to live (unless buffer is full) */
+      if (end == 1 && !ts->full) {
         tvhlog(LOG_DEBUG, "timeshift", "ts %d eob revert to live mode", ts->id);
         ts->state = TS_LIVE;
         cur_speed = 100;
@@ -776,20 +805,20 @@ void *timeshift_reader ( void *p )
 
     /* Flush unwanted */
     } else if (ts->ondemand && cur_file) {
+      pthread_mutex_lock(&ts->rdwr_mutex);
       timeshift_filemgr_flush(ts, cur_file);
+      pthread_mutex_unlock(&ts->rdwr_mutex);
     }
 
-    pthread_mutex_unlock(&ts->rdwr_mutex);
     pthread_mutex_unlock(&ts->state_mutex);
   }
 
   /* Cleanup */
+  tvhpoll_destroy(pd);
   if (fd != -1) close(fd);
   if (sm)       streaming_msg_free(sm);
   if (ctrl)     streaming_msg_free(ctrl);
-#ifdef TSHFT_TRACE
-  tvhlog(LOG_DEBUG, "timeshift", "ts %d exit reader thread", ts->id);
-#endif
+  tvhtrace("timeshift", "ts %d exit reader thread", ts->id);
 
   return NULL;
 }

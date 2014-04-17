@@ -1,6 +1,6 @@
 /*
  *  tvheadend, WEBUI / HTML user interface
- *  Copyright (C) 2008 Andreas Öman
+ *  Copyright (C) 2008 Andreas ï¿½man
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -234,7 +234,7 @@ page_einfo(http_connection_t *hc, const char *remain, void *opaque)
 
   s = epg_episode_get_title(e->episode, lang);
   htsbuf_qprintf(hq, "<hr><b>\"%s\": \"%s\"</b><br><br>",
-	      e->channel->ch_name, s ?: "");
+	      channel_get_name(e->channel));
   
   dvr_status = de != NULL ? de->de_sched_state : DVR_NOSTATE;
 
@@ -422,20 +422,20 @@ page_status(http_connection_t *hc,
 
       html_escape(buf, lang_str_get(de->de_title, NULL), sizeof(buf));
       htsbuf_qprintf(hq, 
-		    "<recording>"
-		     "<start>"
-		     "<date>%d/%02d/%02d</date>"
-		     "<time>%02d:%02d</time>"
-		     "<unixtime>%"PRItime_t"</unixtime>"
-		     "<extra_start>%"PRItime_t"</extra_start>"
-		     "</start>"
-		     "<stop>"
-		     "<date>%d/%02d/%02d</date>"
-		     "<time>%02d:%02d</time>"
-		     "<unixtime>%"PRItime_t"</unixtime>"
-		     "<extra_stop>%"PRItime_t"</extra_stop>"
-		     "</stop>"
-		     "<title>%s</title>",
+		    "<recording>\n"
+		     "<start>\n"
+		     "<date>%d/%02d/%02d</date>\n"
+		     "<time>%02d:%02d</time>\n"
+		     "<unixtime>%"PRItime_t"</unixtime>\n"
+		     "<extra_start>%"PRItime_t"</extra_start>\n"
+		     "</start>\n"
+		     "<stop>\n"
+		     "<date>%d/%02d/%02d</date>\n"
+		     "<time>%02d:%02d</time>\n"
+		     "<unixtime>%"PRItime_t"</unixtime>\n"
+		     "<extra_stop>%"PRItime_t"</extra_stop>\n"
+		     "</stop>\n"
+		     "<title>%s</title>\n",
 		     a.tm_year + 1900, a.tm_mon + 1, a.tm_mday,
 		     a.tm_hour, a.tm_min, 
 		     de->de_start, 
@@ -448,14 +448,14 @@ page_status(http_connection_t *hc,
 
       rstatus = val2str(de->de_sched_state, recstatustxt);
       html_escape(buf, rstatus, sizeof(buf));
-      htsbuf_qprintf(hq, "<status>%s</status></recording>\n", buf);
+      htsbuf_qprintf(hq, "<status>%s</status>\n</recording>\n", buf);
       cc++;
       timeleft = -1;
     }
   }
 
   if ((cc==0) && (timeleft < INT_MAX)) {
-    htsbuf_qprintf(hq, "<recording><next>%d</next></recording>\n",timeleft);
+    htsbuf_qprintf(hq, "<recording>\n<next>%d</next>\n</recording>\n",timeleft);
   }
 
   dvr_query_free(&dqr);
@@ -466,6 +466,27 @@ page_status(http_connection_t *hc,
   pthread_mutex_unlock(&global_lock);
 
   htsbuf_qprintf(hq, "</currentload>");
+  http_output_content(hc, "text/xml");
+
+  return 0;
+}
+
+/**
+ * flush epgdb to disk on call
+ */
+static int
+page_epgsave(http_connection_t *hc,
+	    const char *remain, void *opaque)
+{
+  htsbuf_queue_t *hq = &hc->hc_reply;
+
+  htsbuf_qprintf(hq, "<?xml version=\"1.0\"?>\n"
+                 "<epgflush>1</epgflush>\n");
+
+  pthread_mutex_lock(&global_lock);
+  epg_save();
+  pthread_mutex_unlock(&global_lock);
+
   http_output_content(hc, "text/xml");
 
   return 0;
@@ -483,4 +504,5 @@ simpleui_start(void)
   http_path_add("/eventinfo",   NULL, page_einfo,   ACCESS_SIMPLE);
   http_path_add("/pvrinfo",     NULL, page_pvrinfo, ACCESS_SIMPLE);
   http_path_add("/status.xml",  NULL, page_status,  ACCESS_SIMPLE);
+  http_path_add("/epgsave",	NULL, page_epgsave,     ACCESS_SIMPLE);
 }

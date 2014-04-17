@@ -38,9 +38,10 @@
 #include "service.h"
 
 /* Thread protection */
-static int                   epggrab_confver;
+static int            epggrab_confver;
 pthread_mutex_t       epggrab_mutex;
-static pthread_cond_t        epggrab_cond;
+static pthread_cond_t epggrab_cond;
+int                   epggrab_running;
 
 /* Config */
 uint32_t              epggrab_interval;
@@ -49,6 +50,9 @@ epggrab_module_list_t epggrab_modules;
 uint32_t              epggrab_channel_rename;
 uint32_t              epggrab_channel_renumber;
 uint32_t              epggrab_channel_reicon;
+uint32_t              epggrab_epgdb_periodicsave;
+
+gtimer_t              epggrab_save_timer;
 
 /* **************************************************************************
  * Internal Grab Thread
@@ -93,7 +97,7 @@ static void* _epggrab_internal_thread ( void* p )
 
     /* Check for config change */
     pthread_mutex_lock(&epggrab_mutex);
-    while ( confver == epggrab_confver ) {
+    while ( epggrab_running && confver == epggrab_confver ) {
       if (epggrab_module) {
         err = pthread_cond_timedwait(&epggrab_cond, &epggrab_mutex, &ts);
       } else {
@@ -105,6 +109,9 @@ static void* _epggrab_internal_thread ( void* p )
     mod        = epggrab_module;
     ts.tv_sec += epggrab_interval;
     pthread_mutex_unlock(&epggrab_mutex);
+
+    if ( !epggrab_running)
+      break;
 
     /* Run grabber */
     if (mod) _epggrab_module_grab(mod);
@@ -138,6 +145,10 @@ static void _epggrab_load ( void )
     htsmsg_get_u32(m, "channel_rename",   &epggrab_channel_rename);
     htsmsg_get_u32(m, "channel_renumber", &epggrab_channel_renumber);
     htsmsg_get_u32(m, "channel_reicon",   &epggrab_channel_reicon);
+    htsmsg_get_u32(m, "epgdb_periodicsave", &epggrab_epgdb_periodicsave);
+    if (epggrab_epgdb_periodicsave)
+      gtimer_arm(&epggrab_save_timer, epg_save_callback, NULL,
+                 epggrab_epgdb_periodicsave);
     if (!htsmsg_get_u32(m, old ? "grab-interval" : "interval",
                         &epggrab_interval)) {
       if (old) epggrab_interval *= 3600;
@@ -212,7 +223,7 @@ static void _epggrab_load ( void )
   }
  
   /* Load module config (channels) */
-#if ENABLE_LINUXDVB
+#if 0 //ENABLE_MPEGTS
   eit_load();
   opentv_load();
 #endif
@@ -234,6 +245,7 @@ void epggrab_save ( void )
   htsmsg_add_u32(m, "channel_rename", epggrab_channel_rename);
   htsmsg_add_u32(m, "channel_renumber", epggrab_channel_renumber);
   htsmsg_add_u32(m, "channel_reicon", epggrab_channel_reicon);
+  htsmsg_add_u32(m, "epgdb_periodicsave", epggrab_epgdb_periodicsave);
   htsmsg_add_u32(m, "interval",   epggrab_interval);
   if ( epggrab_module )
     htsmsg_add_str(m, "module", epggrab_module->id);
@@ -299,6 +311,25 @@ int epggrab_set_channel_renumber ( uint32_t e )
   return save;
 }
 
+/*
+ * Config from the webui for period save of db to disk
+ */
+int epggrab_set_periodicsave ( uint32_t e )
+{
+  int save = 0;
+  if ( e != epggrab_epgdb_periodicsave ) {
+    epggrab_epgdb_periodicsave = e;
+    pthread_mutex_lock(&global_lock);
+    if (!e)
+      gtimer_disarm(&epggrab_save_timer);
+    else
+      epg_save(); // will arm the timer
+    pthread_mutex_unlock(&global_lock);
+    save = 1;
+  }
+  return save;
+}
+
 int epggrab_set_channel_reicon ( uint32_t e )
 {
   int save = 0;
@@ -341,37 +372,63 @@ void epggrab_resched ( void )
 /*
  * Initialise
  */
+pthread_t      epggrab_tid;
+
 void epggrab_init ( void )
 {
-  /* Lists */
-#if ENABLE_LINUXDVB
-  extern TAILQ_HEAD(, epggrab_ota_mux) ota_mux_all;
-  TAILQ_INIT(&ota_mux_all);
-#endif
+  /* Defaults */
+  epggrab_interval           = 0;
+  epggrab_module             = NULL;
+  epggrab_channel_rename     = 0;
+  epggrab_channel_renumber   = 0;
+  epggrab_channel_reicon     = 0;
+  epggrab_epgdb_periodicsave = 0;
 
   pthread_mutex_init(&epggrab_mutex, NULL);
   pthread_cond_init(&epggrab_cond, NULL);
-  
+
   /* Initialise modules */
-#if ENABLE_LINUXDVB
+#if ENABLE_MPEGTS
   eit_init();
   opentv_init();
 #endif
   pyepg_init();
   xmltv_init();
 
+  /* Initialise the OTA subsystem */
+  epggrab_ota_init();
+  
   /* Load config */
   _epggrab_load();
-#if ENABLE_LINUXDVB
-  epggrab_ota_load();
-#endif
 
   /* Start internal grab thread */
-  pthread_t      tid;
-  pthread_attr_t tattr;
-  pthread_attr_init(&tattr);
-  pthread_attr_setdetachstate(&tattr, PTHREAD_CREATE_DETACHED);
-  pthread_create(&tid, &tattr, _epggrab_internal_thread, NULL);
-  pthread_attr_destroy(&tattr);
+  epggrab_running = 1;
+  tvhthread_create(&epggrab_tid, NULL, _epggrab_internal_thread, NULL, 0);
 }
 
+/*
+ * Cleanup
+ */
+void epggrab_done ( void )
+{
+  epggrab_module_t *mod;
+
+  epggrab_running = 0;
+  pthread_cond_signal(&epggrab_cond);
+  pthread_join(epggrab_tid, NULL);
+
+  pthread_mutex_lock(&global_lock);
+  while ((mod = LIST_FIRST(&epggrab_modules)) != NULL) {
+    LIST_REMOVE(mod, link);
+    if (mod->type == EPGGRAB_OTA && ((epggrab_module_ota_t *)mod)->done)
+      ((epggrab_module_ota_t *)mod)->done((epggrab_module_ota_t *)mod);
+    if (mod->type == EPGGRAB_INT || mod->type == EPGGRAB_EXT)
+      free((void *)((epggrab_module_int_t *)mod)->path);
+    free((void *)mod->id);
+    free((void *)mod->name);
+    free(mod);
+  }
+  pthread_mutex_unlock(&global_lock);
+  epggrab_ota_done_();
+  opentv_done();
+}

@@ -27,6 +27,7 @@ typedef struct streaming_start_component {
   int ssc_index;
   int ssc_type;
   char ssc_lang[4];
+  uint8_t ssc_audio_type;
   uint16_t ssc_composition_id;
   uint16_t ssc_ancillary_id;
   uint16_t ssc_pid;
@@ -55,6 +56,7 @@ typedef struct streaming_start {
 
   uint16_t ss_pcr_pid;
   uint16_t ss_pmt_pid;
+  uint16_t ss_service_id;
 
   streaming_start_component_t ss_components[0];
 
@@ -109,8 +111,11 @@ void streaming_start_unref(streaming_start_t *ss);
 
 streaming_start_t *streaming_start_copy(const streaming_start_t *src);
 
-int streaming_pad_probe_type(streaming_pad_t *sp, 
-			     streaming_message_type_t smt);
+static inline int
+streaming_pad_probe_type(streaming_pad_t *sp, streaming_message_type_t smt)
+{
+  return (sp->sp_reject_filter & SMT_TO_MASK(smt)) == 0;
+}
 
 const char *streaming_code2txt(int code);
 

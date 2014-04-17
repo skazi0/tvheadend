@@ -19,8 +19,8 @@
 #ifndef __TVH_TIMESHIFT_PRIVATE_H__
 #define __TVH_TIMESHIFT_PRIVATE_H__
 
-#define TIMESHIFT_PLAY_BUF    500000 // us to buffer in TX
-#define TIMESHIFT_FILE_PERIOD     60 // number of secs in each buffer file
+#define TIMESHIFT_PLAY_BUF    2000000 // us to buffer in TX
+#define TIMESHIFT_FILE_PERIOD      60 // number of secs in each buffer file
 
 /**
  * Indexes of import data in the stream
@@ -137,10 +137,12 @@ void timeshift_filemgr_init     ( void );
 void timeshift_filemgr_term     ( void );
 int  timeshift_filemgr_makedirs ( int ts_index, char *buf, size_t len );
 
-timeshift_file_t *timeshift_filemgr_last
-  ( timeshift_t *ts );
 timeshift_file_t *timeshift_filemgr_get
   ( timeshift_t *ts, int create );
+timeshift_file_t *timeshift_filemgr_oldest
+  ( timeshift_t *ts );
+timeshift_file_t *timeshift_filemgr_newest
+  ( timeshift_t *ts );
 timeshift_file_t *timeshift_filemgr_prev
   ( timeshift_file_t *ts, int *end, int keep );
 timeshift_file_t *timeshift_filemgr_next
